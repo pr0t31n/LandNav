@@ -1,0 +1,117 @@
+# ═══════════════════════════════════════════════════════════════════
+# LandNav — Engagement Configuration
+# ═══════════════════════════════════════════════════════════════════
+# Copy to config.yaml and edit before deploying the Pi.
+#   cp config.yaml.example config.yaml
+#   nano config.yaml
+# ═══════════════════════════════════════════════════════════════════
+
+# ── C2 Callback ─────────────────────────────────────────────────
+c2:
+  host: c2.example.com
+  ports:
+    - 4443
+    - 8443
+  # Retry interval (seconds) when all C2 methods fail.
+  # LandNav will cycle through every method, wait this long, then retry.
+  retry_interval: 60
+  # Maximum retries before entering long-backoff (0 = unlimited)
+  max_retries: 0
+  # Long-backoff interval after max_retries exhausted (seconds)
+  backoff_interval: 300
+
+# ── DNS Tunnel (iodine) — Primary C2 ───────────────────────────
+dns_tunnel:
+  enabled: true
+  # Tunnel domain — NS record for this domain must point to c2.host
+  # e.g.  t.example.com  IN  NS  c2.example.com.
+  domain: t.example.com
+  # Shared secret between iodine client and iodined server
+  password: changeme
+  # Maximum downstream fragment size (auto-detected if 0)
+  max_downstream_frag: 0
+  # Encoding: NULL, BASE32, BASE64, BASE128, RAW
+  encoding: ""
+  # Lazy mode (fewer queries when idle, saves bandwidth)
+  lazy_mode: true
+
+# ── Python Meterpreter — Secondary C2 ─────────────────────────
+meterpreter:
+  enabled: true
+  # Connection timeout per attempt (seconds)
+  connect_timeout: 10
+  # Retry delay between port attempts (seconds)
+  retry_delay: 5
+
+# ── Network — Bridge & Discovery ───────────────────────────────
+network:
+  bridge:
+    # Auto-detect USB-ethernet adapter for bridge mode.
+    # If no USB-ethernet found, falls back to standalone mode (eth0 only).
+    auto_detect: true
+    # Disable STP on the bridge (recommended — prevents topology change alerts)
+    stp: false
+    # Rewrite Pi's outgoing MAC to match the legitimate device.
+    # Requires ebtables. Makes the Pi invisible on the switch port.
+    mac_transparency: true
+
+  discovery:
+    # Seconds to wait for DHCP lease / sniffed DHCP exchange
+    dhcp_timeout: 30
+    # Seconds for first passive traffic sniff pass (ARP, DHCP, LLDP/CDP)
+    sniff_timeout: 60
+    # Extended sniff if first pass yields nothing
+    sniff_extended: 300
+    # Seconds per individual ARP probe
+    arp_probe_timeout: 3
+    # Enable RFC 1918 subnet brute force as last resort
+    brute_force: true
+    # Brute-force timeout — abort after this many seconds
+    brute_force_timeout: 1800
+
+  # Last octet to use when assigning the Pi a static IP.
+  # If this conflicts, tries fallback_octets in order.
+  preferred_ip_octet: 236
+  fallback_octets:
+    - 237
+    - 238
+    - 235
+    - 234
+    - 233
+    - 240
+    - 241
+
+  # Fallback DNS servers (used if none discovered from the network)
+  fallback_dns:
+    - 8.8.8.8
+    - 1.1.1.1
+
+  proxy:
+    # Attempt WPAD and common-port proxy detection
+    auto_detect: true
+    # Manual proxy override (leave empty for auto-detect only)
+    host: ""
+    port: 0
+
+# ── LED Status ─────────────────────────────────────────────────
+led:
+  enabled: true
+  # LED sysfs path (Pi 4B green ACT LED)
+  path: /sys/class/leds/ACT
+  # Patterns:
+  #   booting      — slow heartbeat (0.5 Hz)
+  #   bridge_up    — slow blink (1 Hz)
+  #   discovery    — double blink
+  #   network_up   — fast blink (2 Hz)
+  #   c2_attempt   — triple blink
+  #   c2_connected — solid on
+  #   error        — SOS pattern
+  #   shutdown     — fade out (rapid blinks slowing down)
+
+# ── Logging ────────────────────────────────────────────────────
+logging:
+  directory: /opt/pr0t31n/landnav/logs
+  level: INFO          # DEBUG, INFO, WARNING, ERROR
+  max_size_mb: 50      # Rotate logs after this size
+  # Log to console as well (useful for manual testing; disabled in service mode)
+  console: true
