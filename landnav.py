@@ -6,8 +6,9 @@ Automates the entire lifecycle of a drop device deployment:
   2. Establish transparent bridge or direct network access
   3. Discover network configuration (DHCP, ARP, LLDP, brute force)
   4. Configure the Pi's network connectivity
-  5. Establish C2 callback (DNS tunnel → meterpreter → reverse shell)
-  6. Monitor and re-establish C2 on failure
+  5. Start passive recon + Responder analyzer (continuous intelligence)
+  6. Establish C2 callback (DNS tunnel → meterpreter → reverse shell)
+  7. Monitor and re-establish C2 on failure
 
 Designed for Raspberry Pi 4B running Kali Linux ARM.
 Deployed via systemd — runs automatically on boot.
@@ -19,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 import argparse
 import logging
@@ -40,6 +41,8 @@ from lib import netconfig
 from lib import bridge
 from lib import discovery
 from lib import egress
+from lib.passive import PassiveCollector
+from lib.responder import ResponderAnalyzer
 
 # ── Constants ───────────────────────────────────────────────────
 
@@ -47,6 +50,10 @@ DEFAULT_CONFIG = _HERE / "config.yaml"
 LOCK_FILE = Path("/var/run/landnav.pid")
 
 log = logging.getLogger("landnav")
+
+# Passive recon + Responder handles (module-level for status/cleanup)
+_passive_collector = None
+_responder_analyzer = None
 
 # ── Logging Setup ───────────────────────────────────────────────
 
@@ -444,6 +451,83 @@ def phase_validate_network(net_config, cfg):
     led.set_state(led.NETWORK_UP)
     return True
 
+# ── Passive Recon Launch ───────────────────────────────────────
+
+def start_passive_recon(iface_info, cfg):
+    """Start passive network intelligence collection and Responder analyzer.
+
+    Runs as background daemon threads — collects ARP, DNS, DHCP, NetBIOS,
+    LLMNR, mDNS, SSDP traffic plus Responder analyze-mode output.
+    Continues running for the entire lifetime of the deployment.
+
+    Returns: (PassiveCollector, ResponderAnalyzer) or (None, None)
+    """
+    global _passive_collector, _responder_analyzer
+
+    passive_cfg = cfg.get("passive", {})
+    responder_cfg = cfg.get("responder", {})
+
+    if not passive_cfg.get("enabled", True):
+        log.info("Passive recon disabled in config")
+        return None, None
+
+    # Use bridge interface if in bridge mode, otherwise uplink
+    if iface_info["mode"] == "bridge" and bridge.bridge_is_up():
+        sniff_iface = bridge.BRIDGE_NAME
+    else:
+        sniff_iface = iface_info["uplink"]
+
+    recon_dir = Path(cfg.get("logging", {}).get(
+        "directory", "/opt/pr0t31n/landnav/logs")) / "recon"
+
+    log.info("════════ Passive Recon: Starting ════════")
+
+    # Start passive packet collector
+    flush_interval = passive_cfg.get("flush_interval", 30)
+    _passive_collector = PassiveCollector(
+        iface=sniff_iface,
+        recon_dir=str(recon_dir),
+        flush_interval=flush_interval,
+    )
+    _passive_collector.start()
+    log.info("Passive collector started on %s (flush every %ds)",
+             sniff_iface, flush_interval)
+
+    # Start Responder in analyze mode
+    if responder_cfg.get("enabled", True):
+        responder_path = responder_cfg.get("path")
+        _responder_analyzer = ResponderAnalyzer(
+            iface=sniff_iface,
+            recon_dir=str(recon_dir),
+            responder_path=responder_path,
+        )
+        if _responder_analyzer.start():
+            log.info("Responder analyzer started on %s", sniff_iface)
+        else:
+            log.warning("Responder analyzer failed to start — continuing without it")
+            _responder_analyzer = None
+    else:
+        log.info("Responder analyzer disabled in config")
+        _responder_analyzer = None
+
+    return _passive_collector, _responder_analyzer
+
+
+def stop_passive_recon():
+    """Stop passive recon and Responder. Flushes final data to disk."""
+    global _passive_collector, _responder_analyzer
+
+    if _responder_analyzer:
+        log.info("Stopping Responder analyzer")
+        _responder_analyzer.stop()
+        _responder_analyzer = None
+
+    if _passive_collector:
+        log.info("Stopping passive collector (%d hosts observed)",
+                 _passive_collector.get_host_count())
+        _passive_collector.stop()
+        _passive_collector = None
+
 # ── Phase 4: C2 Egress ─────────────────────────────────────────
 
 def phase_c2_egress(net_config, cfg):
@@ -464,6 +548,14 @@ def phase_c2_egress(net_config, cfg):
     if method:
         log.info("════════ C2 ESTABLISHED via %s ════════", method)
         led.set_state(led.C2_CONNECTED)
+
+        # Log passive recon status for operator awareness
+        if _passive_collector:
+            log.info("Passive recon active: %d hosts, %d subnets observed",
+                     _passive_collector.get_host_count(),
+                     len(_passive_collector.get_targets()))
+        if _responder_analyzer and _responder_analyzer.is_running():
+            log.info("Responder analyzer active — LLMNR/NBT-NS/WPAD intelligence collecting")
     else:
         log.error("════════ C2 FAILED — all methods exhausted ════════")
         led.set_state(led.ERROR)
@@ -509,6 +601,11 @@ def main():
         print(f"C2 Method: {egress._c2_method or 'none'}")
         if bridge.bridge_is_up():
             print(f"Bridge: UP ({bridge.BRIDGE_NAME})")
+        if _passive_collector:
+            print(f"Passive Recon: {_passive_collector.get_host_count()} hosts observed")
+            print(f"Subnets: {', '.join(_passive_collector.get_targets())}")
+        if _responder_analyzer and _responder_analyzer.is_running():
+            print(f"Responder: ACTIVE (analyze mode)")
         sys.exit(0)
 
     # PID lock
@@ -551,6 +648,9 @@ def main():
         # ── Phase 3: Validation ─────────────────────────────
         phase_validate_network(net_config, cfg)
 
+        # ── Start passive recon (runs continuously) ─────────
+        start_passive_recon(iface_info, cfg)
+
         # ── Phase 4: C2 Egress ──────────────────────────────
         retry_interval = cfg["c2"].get("retry_interval", 60)
 
@@ -591,6 +691,10 @@ def main():
     finally:
         log.info("LandNav shutting down")
         led.set_state(led.SHUTDOWN)
+
+        # Stop passive recon and flush final data
+        stop_passive_recon()
+
         time.sleep(3)
         led.stop()
 

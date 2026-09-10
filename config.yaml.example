@@ -93,6 +93,42 @@ network:
     host: ""
     port: 0
 
+# ── Passive Network Reconnaissance ────────────────────────────
+# Runs continuously from Phase 3 onward, collecting network intel
+# with zero active traffic. All output written to logs/recon/.
+passive:
+  enabled: true
+  # How often to flush collected data to disk (seconds)
+  flush_interval: 30
+  # Protocols to capture (all enabled by default):
+  #   ARP, DHCP, DNS, NetBIOS, LLMNR, mDNS, SSDP, 802.1Q, STP
+  #
+  # Output files (in logs/recon/):
+  #   hosts.json       — live host inventory (IP, MAC, hostnames, sources)
+  #   subnets.json     — observed subnets with host counts
+  #   dns_queries.log  — timestamped DNS lookups (who resolves what)
+  #   llmnr.json       — LLMNR/NBT-NS broadcast log (poisoning candidates)
+  #   services.json    — mDNS/SSDP advertised services
+  #   targets.txt      — deduplicated /24 CIDRs for scanning
+
+# ── Responder Analyzer Mode ────────────────────────────────────
+# Runs Responder with -A flag (analyze only — NO POISONING).
+# Passively observes LLMNR/NBT-NS/mDNS/WPAD broadcasts and logs:
+#   - Which hosts broadcast name queries (poisoning targets)
+#   - What names they try to resolve (stale DNS, typos)
+#   - WPAD requests (proxy auto-config poisoning candidates)
+#   - Passively observed authentication attempts (NTLMv2 hashes)
+responder:
+  enabled: true
+  # Override Responder path (auto-detected if empty).
+  # Common locations: /usr/share/responder/Responder.py, /usr/bin/responder
+  path: ""
+  #
+  # Output files (in logs/recon/responder/):
+  #   responder_stdout.log     — raw Responder output
+  #   responder_summary.json   — consolidated findings (hashes, candidates, WPAD)
+  #   *.txt                    — copied from Responder's own logs/ directory
+
 # ── LED Status ─────────────────────────────────────────────────
 led:
   enabled: true
