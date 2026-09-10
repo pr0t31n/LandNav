@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 TOOL_NAME = "LandNav"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MIN_PYTHON = (3, 10)
 INSTALL_DIR = Path("/opt/pr0t31n/landnav")
 SERVICE_NAME = "landnav"
@@ -106,6 +106,7 @@ APT_PACKAGES = [
     "curl",             # HTTP testing
     "python3-pip",      # pip
     "python3-scapy",    # scapy (prefer system package on Pi)
+    "responder",        # LLMNR/NBT-NS/WPAD analyzer
 ]
 
 BREW_PACKAGES = [
@@ -125,14 +126,22 @@ def install_system_deps(os_name, dry_run=False):
         _run(["apt-get", "install", "-y", "--no-install-recommends"] + APT_PACKAGES,
              dry_run=dry_run, check=False)
 
+        # Responder may not be in apt on all distros — check if installed
+        if not dry_run and not _has("responder"):
+            # Try installing from Kali repo or clone from GitHub
+            info("Responder not in apt — checking /usr/share/responder/")
+            if not Path("/usr/share/responder/Responder.py").exists():
+                warn("Responder not found — install manually from "
+                     "https://github.com/lgandx/Responder or apt install responder")
+
     elif os_name == "macos":
         if not _has("brew"):
             warn("Homebrew not found — install from https://brew.sh")
             return
         for pkg in BREW_PACKAGES:
             _run(["brew", "install", pkg], dry_run=dry_run, check=False)
-        warn("macOS: bridge/ebtables/arping not available — "
-             "LandNav bridge mode requires Linux")
+        warn("macOS: bridge/ebtables/arping/responder not available — "
+             "LandNav bridge mode and Responder require Linux")
 
     else:
         warn(f"Unknown OS '{os_name}' — install these manually: "
@@ -265,6 +274,8 @@ def setup_directories(dry_run=False):
 
     dirs = [
         INSTALL_DIR / "logs",
+        INSTALL_DIR / "logs" / "recon",
+        INSTALL_DIR / "logs" / "recon" / "responder",
     ]
 
     for d in dirs:
@@ -293,6 +304,8 @@ def verify_install():
         ("arping",      _has("arping")),
         ("iodine",      _has("iodine")),
         ("nmap",        _has("nmap")),
+        ("responder",   _has("responder") or
+                        Path("/usr/share/responder/Responder.py").exists()),
         ("scapy",       _check_import("scapy")),
         ("PyYAML",      _check_import("yaml")),
         ("netifaces",   _check_import("netifaces")),
