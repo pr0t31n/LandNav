@@ -20,12 +20,14 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.3.6"
+VERSION = "0.4.0"
 
 import argparse
+import datetime
 import logging
 import logging.handlers
 import os
+import shutil
 import signal
 import sys
 import time
@@ -48,18 +50,59 @@ from lib.responder import ResponderAnalyzer
 
 DEFAULT_CONFIG = _HERE / "config.yaml"
 LOCK_FILE = Path("/var/run/landnav.pid")
+CLIENTS_BASE = Path("/clients")
+CLEANUP_AGE_DAYS = 30
 
 log = logging.getLogger("landnav")
+
+# Per-run output directory (set in main())
+_run_dir = None
 
 # Passive recon + Responder handles (module-level for status/cleanup)
 _passive_collector = None
 _responder_analyzer = None
 
+# ── Run Directory ───────────────────────────────────────────────
+
+def create_run_dir():
+    """Create a timestamped run directory under /clients.
+
+    Returns: Path to the new run directory.
+    """
+    CLIENTS_BASE.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = CLIENTS_BASE / f"landnav_{ts}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def cleanup_old_runs():
+    """Delete landnav_* run directories older than CLEANUP_AGE_DAYS."""
+    if not CLIENTS_BASE.is_dir():
+        return
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=CLEANUP_AGE_DAYS)
+
+    for entry in CLIENTS_BASE.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("landnav_"):
+            continue
+        # Parse timestamp from directory name: landnav_YYYYMMDD_HHMMSS
+        try:
+            ts_str = entry.name[len("landnav_"):]
+            dir_time = datetime.datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+        except ValueError:
+            continue  # Not a valid landnav run dir
+
+        if dir_time < cutoff:
+            log.info("Cleaning up old run directory: %s", entry)
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 # ── Logging Setup ───────────────────────────────────────────────
 
-def setup_logging(cfg):
+def setup_logging(run_dir, cfg):
     """Configure logging with file rotation and optional console output."""
-    log_dir = Path(cfg.get("directory", "/opt/pr0t31n/landnav/logs"))
+    log_dir = run_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     level = getattr(logging, cfg.get("level", "INFO").upper(), logging.INFO)
 
@@ -554,8 +597,7 @@ def start_passive_recon(iface_info, cfg):
     else:
         sniff_iface = iface_info["uplink"]
 
-    recon_dir = Path(cfg.get("logging", {}).get(
-        "directory", "/opt/pr0t31n/landnav/logs")) / "recon"
+    recon_dir = _run_dir / "recon"
 
     log.info("════════ Passive Recon: Starting ════════")
 
@@ -642,7 +684,7 @@ def phase_c2_egress(net_config, cfg):
 # ── Main ────────────────────────────────────────────────────────
 
 def main():
-    global _shutdown
+    global _shutdown, _run_dir
 
     parser = argparse.ArgumentParser(
         description="LandNav v%s — Rogue device network bootstrapper" % VERSION,
@@ -667,11 +709,7 @@ def main():
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    # Setup logging
-    setup_logging(cfg.get("logging", {}))
-    log.info("LandNav v%s starting", VERSION)
-
-    # Status mode
+    # Status mode — quick read, no side effects
     if args.status:
         print(f"LandNav v{VERSION}")
         print(f"C2 State: {egress._current_state}")
@@ -684,6 +722,17 @@ def main():
         if _responder_analyzer and _responder_analyzer.is_running():
             print(f"Responder: ACTIVE (analyze mode)")
         sys.exit(0)
+
+    # Create run directory under /clients
+    _run_dir = create_run_dir()
+
+    # Setup logging (writes to run dir)
+    setup_logging(_run_dir, cfg.get("logging", {}))
+    log.info("LandNav v%s starting", VERSION)
+    log.info("Run directory: %s", _run_dir)
+
+    # Clean up old run directories (>%d days)
+    cleanup_old_runs()
 
     # PID lock
     if not acquire_lock():
