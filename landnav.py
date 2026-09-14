@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 import argparse
 import logging
@@ -117,13 +117,43 @@ def _handle_signal(signum, frame):
 def phase_detect_interfaces(cfg):
     """Detect ethernet interfaces and determine deployment mode.
 
+    Performs a thorough review of existing networking before deciding:
+      1. Check for existing system-managed bridge → use it (bridge-reuse mode)
+      2. Check for USB-ethernet adapter → LandNav bridge mode
+      3. Single ethernet only → standalone mode
+
     Returns:
-        dict: mode ("bridge" or "standalone"), uplink, downstream
+        dict: mode ("bridge"|"bridge-reuse"|"standalone"),
+              uplink, downstream, existing_bridge (bool)
     """
     log.info("════════ Phase 1: Interface Detection ════════")
 
+    # ── Step 1: Check for existing system-managed bridge ───────
+    # If br0 (or another bridge) already exists with connectivity,
+    # LandNav should use it rather than destroying and recreating.
+    if netconfig.interface_exists(bridge.BRIDGE_NAME):
+        br_info = netconfig.get_interface_info(bridge.BRIDGE_NAME)
+        br_members = netconfig.get_bridge_ports(bridge.BRIDGE_NAME)
+        is_system = netconfig.is_system_managed_bridge(bridge.BRIDGE_NAME)
+        log.info("Existing bridge %s: state=%s ip=%s members=%s system_managed=%s",
+                 bridge.BRIDGE_NAME, br_info["state"], br_info["ip"],
+                 br_members, is_system)
+
+        if is_system and br_info["ip"] and br_info["state"] == "UP":
+            log.info("System-managed bridge %s is UP with IP %s — using it directly",
+                     bridge.BRIDGE_NAME, br_info["ip"])
+            # Identify which member is the uplink (has carrier to the network)
+            uplink = br_members[0] if br_members else None
+            return {
+                "mode": "bridge-reuse",
+                "uplink": uplink,
+                "downstream": br_members[1] if len(br_members) > 1 else None,
+                "existing_bridge": True,
+            }
+
+    # ── Step 2: Detect physical ethernet interfaces ────────────
     ifaces = netconfig.detect_interfaces()
-    log.info("Detected interfaces: %s", ifaces)
+    log.info("Detected physical interfaces: %s", ifaces)
 
     uplink = ifaces["onboard"]
     usb_eth = ifaces["usb_eth"]
@@ -145,16 +175,19 @@ def phase_detect_interfaces(cfg):
     if usb_eth and bridge_cfg.get("auto_detect", True):
         log.info("USB-ethernet detected (%s) — BRIDGE mode", usb_eth)
         netconfig.set_interface_up(usb_eth)
-        return {"mode": "bridge", "uplink": uplink, "downstream": usb_eth}
+        return {"mode": "bridge", "uplink": uplink, "downstream": usb_eth,
+                "existing_bridge": False}
     else:
         log.info("No USB-ethernet — STANDALONE mode on %s", uplink)
-        return {"mode": "standalone", "uplink": uplink, "downstream": None}
+        return {"mode": "standalone", "uplink": uplink, "downstream": None,
+                "existing_bridge": False}
 
 # ── Phase 2: Network Setup ─────────────────────────────────────
 
 def phase_network_setup(iface_info, cfg):
     """Establish network connectivity.
 
+    Bridge-reuse: System bridge already working — read existing config.
     Bridge mode:  Create bridge, sniff legit device traffic, learn config.
     Standalone:   DHCP → passive sniff → active probe → brute force.
 
@@ -169,10 +202,54 @@ def phase_network_setup(iface_info, cfg):
     uplink = iface_info["uplink"]
     downstream = iface_info["downstream"]
 
-    if mode == "bridge":
+    if mode == "bridge-reuse":
+        return _setup_bridge_reuse_mode(net_cfg)
+    elif mode == "bridge":
         return _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg)
     else:
         return _setup_standalone_mode(uplink, net_cfg, disc_cfg)
+
+
+def _setup_bridge_reuse_mode(net_cfg):
+    """Use an existing system-managed bridge that already has connectivity."""
+    import re as _re
+    br_info = netconfig.get_interface_info(bridge.BRIDGE_NAME)
+    log.info("Using existing bridge %s: IP=%s", bridge.BRIDGE_NAME, br_info["ip"])
+
+    config = discovery.NetworkConfig()
+    config.ip = br_info["ip"]
+    config.cidr = br_info["cidr"] or 24
+    config.discovery_method = "existing-bridge"
+
+    # Read gateway from routing table
+    try:
+        r = subprocess.run(["ip", "route", "show", "default"],
+                         capture_output=True, text=True, check=False, timeout=5)
+        m = _re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)", r.stdout)
+        if m:
+            config.gateway = m.group(1)
+    except Exception:
+        pass
+
+    # Read DNS from resolv.conf
+    try:
+        resolv = Path("/etc/resolv.conf").read_text()
+        config.dns_servers = [
+            line.split()[1] for line in resolv.splitlines()
+            if line.strip().startswith("nameserver") and len(line.split()) >= 2
+        ]
+    except Exception:
+        config.dns_servers = net_cfg.get("fallback_dns", ["8.8.8.8"])
+
+    # Enable promiscuous mode for passive recon
+    try:
+        netconfig.set_interface_promisc(bridge.BRIDGE_NAME, True)
+    except Exception:
+        pass
+
+    log.info("Bridge reuse: IP=%s GW=%s DNS=%s",
+             config.ip, config.gateway, config.dns_servers)
+    return config
 
 
 def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
@@ -698,9 +775,9 @@ def main():
         time.sleep(3)
         led.stop()
 
-        # Cleanup bridge if we created one
-        if bridge.bridge_is_up():
-            bridge.destroy_bridge()
+        # Cleanup bridge — destroy_bridge() is safe: it checks the marker
+        # file and refuses to touch system-managed or non-LandNav bridges.
+        bridge.destroy_bridge()
 
         release_lock()
         log.info("LandNav stopped")
