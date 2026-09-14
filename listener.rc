@@ -17,9 +17,14 @@ set LHOST 10.20.70.172
 set LPORT 4443
 set ExitOnSession false
 
-# Keep sessions alive over lossy / NAT'd links
-set SessionCommunicationTimeout 0
-set SessionExpirationTimeout 0
+# Keep sessions alive over lossy / NAT'd links.
+# DO NOT use 0 — the Python meterpreter stage interprets 0 as
+# "expire immediately" (communication_last + 0 < time.time() is True
+# after one select() cycle).  The stage's session_has_expired handles
+# 0 correctly but communication_has_expired does NOT.  Use large
+# non-zero values instead.
+set SessionCommunicationTimeout 3600
+set SessionExpirationTimeout 604800
 
 # Auto-run on every new session: add default route via post module
 # (multi_console_command loses quotes in .rc files — use the post module directly)

