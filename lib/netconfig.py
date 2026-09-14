@@ -33,21 +33,56 @@ def _has(binary):
 
 # ── Interface Detection ─────────────────────────────────────────
 
+def _is_virtual_iface(name):
+    """Return True for interfaces LandNav should never manage.
+
+    Covers tun/tap, ZeroTier, WireGuard, VPN, Docker, veth, and any
+    interface that is already a bridge member or a bridge itself.
+    """
+    # Name-pattern exclusions
+    _SKIP_PREFIXES = (
+        "br", "dns", "zt", "wg", "tun", "tap", "veth", "docker",
+        "virbr", "vnet", "eval", "vmnet",
+    )
+    if name.startswith(_SKIP_PREFIXES):
+        return True
+
+    # Check if this interface is a member of a bridge (has a brport/ dir)
+    brport = Path(f"/sys/class/net/{name}/brport")
+    if brport.exists():
+        return True
+
+    # Check tun/tap type via tun_flags sysfs
+    tun_flags = Path(f"/sys/class/net/{name}/tun_flags")
+    if tun_flags.exists():
+        return True
+
+    return False
+
+
 def detect_interfaces():
-    """Detect available ethernet interfaces.
+    """Detect available physical ethernet interfaces.
+
+    Excludes virtual interfaces (bridges, taps, tunnels, ZeroTier, VPN,
+    Docker, veth pairs) and interfaces already bridged by the system.
 
     Returns:
         dict with keys:
             onboard: str or None — onboard ethernet (eth0, end0, etc.)
             usb_eth: str or None — USB ethernet adapter (eth1, enx*, usb0, etc.)
-            all_eth: list[str] — all detected ethernet interfaces
+            all_eth: list[str] — all detected physical ethernet interfaces
     """
     result = {"onboard": None, "usb_eth": None, "all_eth": []}
     sys_net = Path("/sys/class/net")
 
     for iface in sorted(sys_net.iterdir()):
         name = iface.name
-        if name == "lo" or name.startswith("br") or name.startswith("dns"):
+        if name == "lo":
+            continue
+
+        # Skip virtual/managed interfaces
+        if _is_virtual_iface(name):
+            log.debug("Skipping virtual/managed interface: %s", name)
             continue
 
         itype = (iface / "type").read_text().strip() if (iface / "type").exists() else ""
@@ -79,6 +114,88 @@ def detect_interfaces():
         result["usb_eth"] = result["all_eth"][1]
 
     return result
+
+
+def get_bridge_ports(bridge_name):
+    """Return list of interface names that are members of a bridge."""
+    brif = Path(f"/sys/class/net/{bridge_name}/brif")
+    if not brif.is_dir():
+        return []
+    return sorted(p.name for p in brif.iterdir())
+
+
+def is_system_managed_bridge(bridge_name):
+    """Check whether a bridge is defined in persistent system networking config.
+
+    Checks /etc/network/interfaces, NetworkManager connections, and netplan.
+    A system-managed bridge must NEVER be destroyed by LandNav.
+    """
+    # Check /etc/network/interfaces
+    ifaces_file = Path("/etc/network/interfaces")
+    if ifaces_file.exists():
+        try:
+            text = ifaces_file.read_text()
+            # Look for bridge definition lines
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                # "iface br0 inet ..." or "auto br0" or "bridge-ports" in a br0 stanza
+                if (f"iface {bridge_name}" in stripped
+                        or f"auto {bridge_name}" in stripped):
+                    return True
+        except Exception:
+            pass
+
+    # Check /etc/network/interfaces.d/ drop-ins
+    ifaces_d = Path("/etc/network/interfaces.d")
+    if ifaces_d.is_dir():
+        try:
+            for f in ifaces_d.iterdir():
+                if not f.is_file():
+                    continue
+                text = f.read_text()
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        continue
+                    if (f"iface {bridge_name}" in stripped
+                            or f"auto {bridge_name}" in stripped):
+                        return True
+        except Exception:
+            pass
+
+    # Check NetworkManager managed connections
+    nm_sys = Path("/etc/NetworkManager/system-connections")
+    if nm_sys.is_dir():
+        try:
+            for f in nm_sys.iterdir():
+                if not f.is_file():
+                    continue
+                text = f.read_text()
+                if f"interface-name={bridge_name}" in text and "type=bridge" in text:
+                    return True
+        except Exception:
+            pass
+
+    # Check netplan
+    netplan_dir = Path("/etc/netplan")
+    if netplan_dir.is_dir():
+        try:
+            import yaml as _yaml
+        except ImportError:
+            _yaml = None
+        if _yaml:
+            for f in netplan_dir.glob("*.yaml"):
+                try:
+                    data = _yaml.safe_load(f.read_text()) or {}
+                    bridges = data.get("network", {}).get("bridges", {})
+                    if bridge_name in bridges:
+                        return True
+                except Exception:
+                    pass
+
+    return False
 
 
 def get_interface_info(iface):
