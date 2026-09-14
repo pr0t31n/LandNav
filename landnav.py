@@ -152,8 +152,10 @@ _shutdown = False
 
 def _handle_signal(signum, frame):
     global _shutdown
-    log.info("Received signal %d — shutting down", signum)
     _shutdown = True
+    # Kill any blocking child (pty.spawn / iodine) so we actually exit.
+    # force_shutdown is signal-safe — no logging inside it.
+    egress.force_shutdown()
 
 # ── Phase 1: Interface Detection ───────────────────────────────
 
