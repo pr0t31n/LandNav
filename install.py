@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 TOOL_NAME = "LandNav"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 MIN_PYTHON = (3, 10)
 INSTALL_DIR = Path("/opt/pr0t31n/landnav")
 SERVICE_NAME = "landnav"
@@ -382,6 +382,10 @@ def main():
                         help="Skip Python package installation")
     parser.add_argument("--uninstall", action="store_true",
                         help="Remove systemd service and NM config")
+    parser.add_argument("--skip-go", action="store_true",
+                        help="(no-op) LandNav has no Go dependencies")
+    parser.add_argument("--skip-git", action="store_true",
+                        help="(no-op) LandNav has no git tool dependencies")
     args = parser.parse_args()
 
     print(f"\n{_C['B']}{'═' * 60}")
