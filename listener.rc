@@ -129,14 +129,32 @@ if chisel_cfg.fetch('enabled', false)
       chisel_cmd += " --auth '#{chisel_auth}'" unless chisel_auth.empty?
 
       if chisel_tls
-        # Chisel auto-generates a self-signed TLS cert if none provided
         key_file = chisel_cfg['tls_key'] || ''
         cert_file = chisel_cfg['tls_cert'] || ''
-        if !key_file.empty? && !cert_file.empty? && File.exist?(key_file)
-          chisel_cmd += " --tls-key #{key_file} --tls-cert #{cert_file}"
-        else
-          chisel_cmd += " --tls-key '' --tls-cert ''"
+
+        # If no custom certs configured, auto-generate a self-signed pair.
+        # Chisel does NOT auto-generate certs — passing empty strings
+        # makes it run plain HTTP, which breaks the client's https:// URL.
+        if key_file.empty? || cert_file.empty? || !File.exist?(key_file)
+          tls_dir = "#{LANDNAV_DIR}/keys"
+          system("mkdir -p #{tls_dir}")
+          key_file = "#{tls_dir}/chisel_tls.key"
+          cert_file = "#{tls_dir}/chisel_tls.crt"
+          if !File.exist?(key_file) || !File.exist?(cert_file)
+            c2_host = (cfg['c2'] || {})['host'] || 'localhost'
+            gen_ok = system("openssl req -x509 -newkey ec " \
+              "-pkeyopt ec_paramgen_curve:prime256v1 -nodes " \
+              "-keyout #{key_file} -out #{cert_file} " \
+              "-days 3650 -subj '/CN=#{c2_host}' 2>/dev/null")
+            if gen_ok
+              print_line("[*] Auto-generated chisel TLS cert: #{cert_file}")
+            else
+              print_line("[!] openssl cert generation failed — chisel may not start with TLS")
+            end
+          end
         end
+
+        chisel_cmd += " --tls-key #{key_file} --tls-cert #{cert_file}"
       end
 
       # Background — setsid detaches from msfconsole's process group
