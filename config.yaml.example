@@ -33,7 +33,7 @@ c2:
 chisel:
   enabled: true
   # Port the chisel server listens on (c2-server side)
-  server_port: 443
+  server_port: 8443
   # Shared auth — must match chisel server's --auth flag
   auth: "landnav:changeme"
   # Use TLS (should be true for port 443 — matches normal HTTPS)
