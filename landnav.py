@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.5.7"
+VERSION = "0.5.8"
 
 import argparse
 import datetime
@@ -754,6 +754,9 @@ def main():
                         help="Log actions without executing network changes")
     parser.add_argument("--status", action="store_true",
                         help="Print current state and exit")
+    parser.add_argument("--prep-handler", action="store_true",
+                        help="Strip auto_commands.txt for SSH-tunneled ports and exit "
+                             "(run on the C2 server before starting msfconsole)")
     parser.add_argument("--version", "-v", action="version",
                         version=f"LandNav {VERSION}")
     args = parser.parse_args()
@@ -767,6 +770,17 @@ def main():
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+
+    # Prep-handler mode — strip auto_commands.txt and exit.
+    # Run this on the C2 server (the C2 server) before starting msfconsole.
+    # LandNav's main startup (below) also calls _generate_auto_commands()
+    # for the same-machine case, but when the implant (beretta) and the
+    # handler (the C2 server) are separate machines, the implant-side strip has
+    # no effect on the C2 server's copy.  This mode lets listener.rc trigger
+    # the strip on the C2 server via a <ruby> system() call.
+    if args.prep_handler:
+        _generate_auto_commands(cfg)
+        sys.exit(0)
 
     # Status mode — quick read, no side effects
     if args.status:

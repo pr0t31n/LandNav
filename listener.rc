@@ -11,6 +11,28 @@
 # Python meterpreter is single-threaded and heavy SOCKS browsing
 # (especially WebSocket/SocketIO apps) starves the command channel.
 
+# ── Pre-process auto_commands.txt ──────────────────────────────
+# LandNav's _generate_auto_commands() strips portfwd lines whose
+# local port matches an SSH tunnel port from config.yaml.  That
+# function runs on the *implant* (beretta) at startup, but
+# Metasploit reads auto_commands.txt from *this* machine (the C2 server).
+# The Ruby block below calls the same logic on the C2 server so the
+# handler sees the stripped file.
+<ruby>
+landnav_dir = '/opt/pr0t31n/LandNav'
+prep = "#{landnav_dir}/prep_handler.py"
+if File.exist?(prep)
+  ret = system("python3 #{prep} -c #{landnav_dir}/config.yaml")
+  if ret
+    print_line("[*] LandNav: auto_commands.txt prepared (SSH tunnel ports stripped)")
+  else
+    print_line("[!] LandNav: prep_handler.py failed — using auto_commands.txt as-is")
+  end
+else
+  print_line("[*] LandNav: prep_handler.py not found — using auto_commands.txt as-is")
+end
+</ruby>
+
 # ── SOCKS Proxy (start first so it's ready when session arrives) ──
 use auxiliary/server/socks_proxy
 set SRVPORT 1080
