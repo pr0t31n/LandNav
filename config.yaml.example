@@ -38,10 +38,12 @@ chisel:
   auth: "landnav:changeme"
   # Use TLS (should be true for port 443 — matches normal HTTPS)
   tls: true
-  # SOCKS5 proxy port on the C2 server (0 = disabled)
-  # Provides proxy-based access into the target network for any tool:
-  #   proxychains nmap -sT 10.10.240.0/24
-  socks_port: 1080
+  # SOCKS5 proxy port on the C2 server via chisel (0 = disabled)
+  # Separate from Metasploit's SOCKS proxy on :1080 (which routes
+  # through meterpreter sessions).  Chisel SOCKS is a native TCP
+  # tunnel — faster and doesn't starve the meterpreter channel.
+  #   proxychains -q nmap -sT -p- 10.10.240.0/24
+  socks_port: 1081
   # Reconnection tuning — chisel retries indefinitely by default
   keepalive: 25s
   max_retry_interval: 30s

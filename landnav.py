@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.6.9"
+VERSION = "0.6.10"
 
 import argparse
 import datetime
@@ -813,6 +813,13 @@ def _ensure_config_current(cfg, config_path):
     if cfg.get("chisel", {}).get("server_port") == 443:
         cfg["chisel"]["server_port"] = 8443
         log.info("Config: migrated chisel.server_port 443 → 8443")
+        changed = True
+
+    # v0.6.9: chisel SOCKS port 1080 → 1081
+    #         (1080 conflicts with Metasploit's SOCKS proxy in listener.rc)
+    if cfg.get("chisel", {}).get("socks_port") == 1080:
+        cfg["chisel"]["socks_port"] = 1081
+        log.info("Config: migrated chisel.socks_port 1080 → 1081")
         changed = True
 
     if changed:
