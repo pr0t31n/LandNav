@@ -118,58 +118,90 @@ end
 chisel_cfg = cfg['chisel'] || {}
 if chisel_cfg.fetch('enabled', false)
   if system("command -v chisel >/dev/null 2>&1")
-    if system("pgrep -xf 'chisel server' >/dev/null 2>&1")
-      print_line("[*] Chisel server already running ✓")
-    else
       chisel_port = chisel_cfg['server_port'] || 8443
       chisel_auth = chisel_cfg['auth'] || ''
       chisel_tls = chisel_cfg.fetch('tls', true)
+      chisel_ok = true   # assume we can start; gates below may flip this
 
-      chisel_cmd = "chisel server --reverse --port #{chisel_port}"
-      chisel_cmd += " --auth '#{chisel_auth}'" unless chisel_auth.empty?
-
-      if chisel_tls
-        key_file = chisel_cfg['tls_key'] || ''
-        cert_file = chisel_cfg['tls_cert'] || ''
-
-        # If no custom certs configured, auto-generate a self-signed pair.
-        # Chisel does NOT auto-generate certs — passing empty strings
-        # makes it run plain HTTP, which breaks the client's https:// URL.
-        if key_file.empty? || cert_file.empty? || !File.exist?(key_file)
-          tls_dir = "#{LANDNAV_DIR}/keys"
-          system("mkdir -p #{tls_dir}")
-          key_file = "#{tls_dir}/chisel_tls.key"
-          cert_file = "#{tls_dir}/chisel_tls.crt"
-          if !File.exist?(key_file) || !File.exist?(cert_file)
-            c2_host = (cfg['c2'] || {})['host'] || 'localhost'
-            gen_ok = system("openssl req -x509 -newkey ec " \
-              "-pkeyopt ec_paramgen_curve:prime256v1 -nodes " \
-              "-keyout #{key_file} -out #{cert_file} " \
-              "-days 3650 -subj '/CN=#{c2_host}' 2>/dev/null")
-            if gen_ok
-              print_line("[*] Auto-generated chisel TLS cert: #{cert_file}")
-            else
-              print_line("[!] openssl cert generation failed — chisel may not start with TLS")
-            end
+      # ── Port conflict detection ──────────────────────────────
+      # Check if anything is already listening on the target port.
+      # If it's a stale chisel, kill it.  If it's something else,
+      # give up — don't fight another service for the port.
+      port_pid = `ss -tlnp sport = :#{chisel_port} 2>/dev/null`
+                   .scan(/pid=(\d+)/).flatten.first
+      if port_pid
+        port_cmd = `ps -p #{port_pid} -o comm= 2>/dev/null`.strip rescue ''
+        if port_cmd == 'chisel'
+          print_line("[*] Killing stale chisel (pid #{port_pid}) on :#{chisel_port}")
+          system("kill #{port_pid} 2>/dev/null")
+          sleep(1)
+          # Force-kill if still alive
+          if system("kill -0 #{port_pid} 2>/dev/null")
+            system("kill -9 #{port_pid} 2>/dev/null")
+            sleep(0.5)
           end
-        end
-
-        chisel_cmd += " --tls-key #{key_file} --tls-cert #{cert_file}"
-      end
-
-      # Background — setsid detaches from msfconsole's process group
-      chisel_cmd += " </dev/null >/var/log/chisel.log 2>&1 &"
-      if system("setsid #{chisel_cmd}")
-        sleep(1)
-        if system("pgrep -xf 'chisel server' >/dev/null 2>&1")
-          print_line("[*] Chisel server started on :#{chisel_port} (TLS=#{chisel_tls})")
         else
-          print_line("[!] Chisel server failed to start — check /var/log/chisel.log")
+          print_line("[!] Port #{chisel_port} in use by '#{port_cmd}' (pid #{port_pid}) — not chisel")
+          print_line("[!] Chisel server cannot start — resolve the port conflict manually")
+          chisel_ok = false
         end
       else
-        print_line("[!] Chisel server failed to launch")
+        # No port conflict — but kill any orphaned chisel server procs
+        # that aren't bound to the right port (leftover from old config)
+        orphans = `pgrep -xf 'chisel server' 2>/dev/null`.strip.split
+        orphans.each do |opid|
+          print_line("[*] Killing orphaned chisel server (pid #{opid})")
+          system("kill #{opid} 2>/dev/null")
+        end
+        sleep(0.5) unless orphans.empty?
       end
-    end
+
+      if chisel_ok
+        chisel_cmd = "chisel server --reverse --port #{chisel_port}"
+        chisel_cmd += " --auth '#{chisel_auth}'" unless chisel_auth.empty?
+
+        if chisel_tls
+          key_file = chisel_cfg['tls_key'] || ''
+          cert_file = chisel_cfg['tls_cert'] || ''
+
+          # Auto-generate a self-signed cert if none configured.
+          # Chisel does NOT auto-generate certs — without real files
+          # it runs plain HTTP, breaking the client's https:// URL.
+          if key_file.empty? || cert_file.empty? || !File.exist?(key_file)
+            tls_dir = "#{LANDNAV_DIR}/keys"
+            system("mkdir -p #{tls_dir}")
+            key_file = "#{tls_dir}/chisel_tls.key"
+            cert_file = "#{tls_dir}/chisel_tls.crt"
+            if !File.exist?(key_file) || !File.exist?(cert_file)
+              c2_host = (cfg['c2'] || {})['host'] || 'localhost'
+              gen_ok = system("openssl req -x509 -newkey ec " \
+                "-pkeyopt ec_paramgen_curve:prime256v1 -nodes " \
+                "-keyout #{key_file} -out #{cert_file} " \
+                "-days 3650 -subj '/CN=#{c2_host}' 2>/dev/null")
+              if gen_ok
+                print_line("[*] Auto-generated chisel TLS cert: #{cert_file}")
+              else
+                print_line("[!] openssl cert generation failed — chisel may not start with TLS")
+              end
+            end
+          end
+
+          chisel_cmd += " --tls-key #{key_file} --tls-cert #{cert_file}"
+        end
+
+        # Background — setsid detaches from msfconsole's process group
+        chisel_cmd += " </dev/null >/var/log/chisel.log 2>&1 &"
+        if system("setsid #{chisel_cmd}")
+          sleep(1)
+          if system("pgrep -xf 'chisel server' >/dev/null 2>&1")
+            print_line("[*] Chisel server started on :#{chisel_port} (TLS=#{chisel_tls})")
+          else
+            print_line("[!] Chisel server failed to start — check /var/log/chisel.log")
+          end
+        else
+          print_line("[!] Chisel server failed to launch")
+        end
+      end
   else
     print_line("[!] chisel not installed — HTTPS tunnel unavailable")
     print_line("[!]   Install: go install github.com/jpillora/chisel@latest")
