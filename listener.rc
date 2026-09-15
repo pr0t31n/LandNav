@@ -148,7 +148,7 @@ if chisel_cfg.fetch('enabled', false)
       else
         # No port conflict — but kill any orphaned chisel server procs
         # that aren't bound to the right port (leftover from old config)
-        orphans = `pgrep -xf 'chisel server' 2>/dev/null`.strip.split
+        orphans = `pgrep -f 'chisel server' 2>/dev/null`.strip.split
         orphans.each do |opid|
           print_line("[*] Killing orphaned chisel server (pid #{opid})")
           system("kill #{opid} 2>/dev/null")
@@ -193,8 +193,13 @@ if chisel_cfg.fetch('enabled', false)
         chisel_cmd += " </dev/null >/var/log/chisel.log 2>&1 &"
         if system("setsid #{chisel_cmd}")
           sleep(1)
-          if system("pgrep -xf 'chisel server' >/dev/null 2>&1")
-            print_line("[*] Chisel server started on :#{chisel_port} (TLS=#{chisel_tls})")
+          # Verify by checking the port, not pgrep — the full command line
+          # (chisel server --reverse --port ... --auth ...) won't match a
+          # short pgrep -xf pattern.
+          verify_pid = `ss -tlnp sport = :#{chisel_port} 2>/dev/null`
+                         .scan(/pid=(\d+)/).flatten.first
+          if verify_pid
+            print_line("[*] Chisel server started on :#{chisel_port} (TLS=#{chisel_tls}, pid #{verify_pid})")
           else
             print_line("[!] Chisel server failed to start — check /var/log/chisel.log")
           end
