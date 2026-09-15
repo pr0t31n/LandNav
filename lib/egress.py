@@ -172,6 +172,17 @@ def _start_ssh_tunnels(c2_host, tunnel_cfg):
         log.error("SSH tunnels: key not found at %s — skipping", key_path)
         return None
 
+    # Ensure private key has 0600 permissions — git does not preserve
+    # this, so a fresh clone/pull leaves the key at 0644 which SSH
+    # refuses with "UNPROTECTED PRIVATE KEY FILE".
+    try:
+        _key_mode = os.stat(key_path).st_mode & 0o777
+        if _key_mode != 0o600:
+            os.chmod(key_path, 0o600)
+            log.info("SSH tunnels: fixed key permissions %o → 600", _key_mode)
+    except OSError as e:
+        log.warning("SSH tunnels: cannot fix key permissions: %s", e)
+
     cmd = [
         "ssh", "-N",
         "-o", "StrictHostKeyChecking=no",

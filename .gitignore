@@ -1,0 +1,9 @@
+# Private keys — generated per-device, never committed
+keys/tunnel_key
+keys/tunnel_key.pub
+
+# Runtime
+__pycache__/
+*.pyc
+logs/
+*.log

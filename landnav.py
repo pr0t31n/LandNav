@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.5.5"
+VERSION = "0.5.7"
 
 import argparse
 import datetime
@@ -683,6 +683,63 @@ def phase_c2_egress(net_config, cfg):
 
     return method
 
+# ── Auto-commands generation ────────────────────────────────────
+
+_AUTO_CMD_PATH = _HERE / "auto_commands.txt"
+
+def _generate_auto_commands(cfg: dict):
+    """Rewrite auto_commands.txt based on config.
+
+    When SSH tunnels are configured, their local_port values overlap with the
+    portfwd rules in auto_commands.txt.  Metasploit's portfwd binds IPv4
+    first (AutoRunScript runs on session-open), so the SSH tunnels — started
+    later — can only get IPv6.  All IPv4 connections then go to the portfwd
+    (which is single-threaded through the meterpreter transport and unusable
+    for browsable web services).
+
+    Fix: strip portfwd lines whose local port matches an SSH tunnel port.
+    The SSH tunnels become the sole forwarding mechanism for those services.
+    Non-overlapping portfwd lines are preserved so the system handles mixed
+    configurations.
+    """
+    tunnel_cfg = cfg.get("ssh_tunnels")
+    tunnel_ports: set = set()
+    if tunnel_cfg:
+        for fwd in tunnel_cfg.get("forwards", []):
+            lp = fwd.get("local_port")
+            if lp:
+                tunnel_ports.add(int(lp))
+
+    if not _AUTO_CMD_PATH.exists():
+        log.debug("auto_commands.txt not found — skipping generation")
+        return
+
+    original_lines = _AUTO_CMD_PATH.read_text().splitlines()
+    kept: list = []
+    stripped: list = []
+    for line in original_lines:
+        raw = line.strip()
+        if raw.startswith("portfwd") and tunnel_ports:
+            # Parse: portfwd add -l <port> -p <rport> -r <host>
+            parts = raw.split()
+            try:
+                li = parts.index("-l")
+                lport = int(parts[li + 1])
+                if lport in tunnel_ports:
+                    stripped.append((lport, raw))
+                    continue
+            except (ValueError, IndexError):
+                pass
+        kept.append(line)
+
+    if stripped:
+        _AUTO_CMD_PATH.write_text("\n".join(kept) + "\n")
+        for sp, sl in stripped:
+            log.info("auto_commands: stripped portfwd -l %d (SSH tunnel takes over)", sp)
+    else:
+        log.debug("auto_commands: no portfwd/SSH-tunnel overlap — unchanged")
+
+
 # ── Main ────────────────────────────────────────────────────────
 
 def main():
@@ -732,6 +789,9 @@ def main():
     setup_logging(_run_dir, cfg.get("logging", {}))
     log.info("LandNav v%s starting", VERSION)
     log.info("Run directory: %s", _run_dir)
+
+    # Generate auto_commands.txt — strip portfwd for SSH-tunneled ports
+    _generate_auto_commands(cfg)
 
     # Clean up old run directories (>%d days)
     cleanup_old_runs()
