@@ -20,16 +20,19 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 import argparse
 import datetime
 import logging
 import logging.handlers
 import os
+import platform
 import shutil
 import signal
+import subprocess
 import sys
+import tempfile
 import time
 import yaml
 from pathlib import Path
@@ -751,6 +754,133 @@ def _generate_auto_commands(cfg: dict):
         log.debug("auto_commands: no portfwd/SSH-tunnel overlap — unchanged")
 
 
+# ── Auto-Setup Helpers ──────────────────────────────────────────
+
+_CHISEL_VERSION = "1.10.1"
+_CHISEL_ARCH_MAP = {
+    "aarch64": "arm64", "arm64": "arm64",
+    "x86_64": "amd64", "amd64": "amd64",
+    "armv7l": "armv7", "armv6l": "armv6",
+}
+
+
+def _ensure_config_current(cfg, config_path):
+    """Add missing top-level config sections from config.yaml.example.
+
+    When LandNav is upgraded (e.g. Chisel added in v0.6.0), new config
+    sections appear in the example but not in the live config.yaml.
+    This merges missing sections into the live config automatically —
+    existing settings are never overwritten.
+    """
+    example_path = _HERE / "config.yaml.example"
+    if not example_path.exists():
+        return cfg
+
+    try:
+        with open(example_path) as f:
+            example_cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        log.warning("Could not read config.yaml.example: %s", e)
+        return cfg
+
+    missing = {k: v for k, v in example_cfg.items() if k not in cfg}
+    if not missing:
+        return cfg
+
+    log.info("Config: adding missing sections: %s", ", ".join(missing.keys()))
+    cfg.update(missing)
+
+    try:
+        with open(config_path, "a") as f:
+            f.write("\n# ── Auto-added by LandNav v%s ──\n" % VERSION)
+            yaml.dump(missing, f, default_flow_style=False, sort_keys=False)
+        log.info("Config: updated %s", config_path)
+    except Exception as e:
+        log.warning("Config: could not write to file: %s (sections loaded in memory)", e)
+
+    return cfg
+
+
+def _ensure_chisel_binary():
+    """Download the chisel binary if not in PATH.
+
+    Architecture-aware: detects arm64 (Pi 4/5), amd64 (x86), armv7/v6.
+    Uses curl (a LandNav dependency) for the download.
+    """
+    if shutil.which("chisel"):
+        return
+
+    arch = _CHISEL_ARCH_MAP.get(platform.machine())
+    if not arch:
+        log.warning("Chisel: unknown architecture %s — cannot auto-install",
+                     platform.machine())
+        return
+
+    sysname = "darwin" if platform.system().lower() == "darwin" else "linux"
+    filename = "chisel_%s_%s_%s.gz" % (_CHISEL_VERSION, sysname, arch)
+    url = ("https://github.com/jpillora/chisel/releases/download/"
+           "v%s/%s" % (_CHISEL_VERSION, filename))
+    dest = Path("/usr/local/bin/chisel")
+
+    log.info("Chisel not installed — downloading %s for %s/%s",
+             _CHISEL_VERSION, sysname, arch)
+
+    tmp_gz = None
+    try:
+        tmp_fd, tmp_gz = tempfile.mkstemp(suffix=".gz")
+        os.close(tmp_fd)
+
+        rc = subprocess.run(
+            ["curl", "-fsSL", "-o", tmp_gz, url],
+            capture_output=True, text=True, timeout=120,
+        )
+        if rc.returncode != 0:
+            log.error("Chisel download failed: %s", rc.stderr[:300])
+            return
+
+        # Decompress: gunzip replaces file.gz with file
+        subprocess.run(["gunzip", "-f", tmp_gz],
+                       capture_output=True, timeout=30)
+        tmp_bin = tmp_gz[:-3]  # gunzip strips .gz
+
+        shutil.move(tmp_bin, str(dest))
+        dest.chmod(0o755)
+        log.info("Chisel installed: %s", dest)
+
+    except Exception as e:
+        log.error("Chisel auto-install failed: %s", e)
+    finally:
+        # Clean up temp files
+        if tmp_gz:
+            for p in (tmp_gz, tmp_gz.replace(".gz", "")):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def _ensure_ssh_keys():
+    """Generate SSH tunnel keypair if missing."""
+    key_path = _HERE / "keys" / "tunnel_key"
+    if key_path.exists():
+        return
+
+    log.info("SSH tunnel key not found — generating ed25519 keypair")
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        hostname = platform.node() or "landnav"
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", str(key_path),
+             "-N", "", "-C", "landnav-tunnel@%s" % hostname],
+            capture_output=True, check=True, timeout=30,
+        )
+        key_path.chmod(0o600)
+        log.info("SSH tunnel key generated: %s", key_path)
+    except Exception as e:
+        log.error("SSH key generation failed: %s", e)
+
+
 # ── Main ────────────────────────────────────────────────────────
 
 def main():
@@ -814,6 +944,11 @@ def main():
     setup_logging(_run_dir, cfg.get("logging", {}))
     log.info("LandNav v%s starting", VERSION)
     log.info("Run directory: %s", _run_dir)
+
+    # Auto-setup: merge new config sections, install binaries, generate keys
+    cfg = _ensure_config_current(cfg, config_path)
+    _ensure_chisel_binary()
+    _ensure_ssh_keys()
 
     # Generate auto_commands.txt — strip portfwd for SSH-tunneled ports
     _generate_auto_commands(cfg)
