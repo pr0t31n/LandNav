@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 
 import argparse
 import datetime
@@ -765,12 +765,16 @@ _CHISEL_ARCH_MAP = {
 
 
 def _ensure_config_current(cfg, config_path):
-    """Add missing top-level config sections from config.yaml.example.
+    """Sync live config with config.yaml.example.
 
-    When LandNav is upgraded (e.g. Chisel added in v0.6.0), new config
-    sections appear in the example but not in the live config.yaml.
-    This merges missing sections into the live config automatically —
-    existing settings are never overwritten.
+    Three levels of merge:
+      1. Missing top-level sections → added wholesale
+      2. Missing keys within existing sections → added with example defaults
+      3. Changed defaults in example → updated in live config
+
+    User-set values that differ from BOTH the old and new example defaults
+    are never touched.  Only values that still match the previous example
+    default get upgraded to the new one.
     """
     example_path = _HERE / "config.yaml.example"
     if not example_path.exists():
@@ -783,20 +787,41 @@ def _ensure_config_current(cfg, config_path):
         log.warning("Could not read config.yaml.example: %s", e)
         return cfg
 
-    missing = {k: v for k, v in example_cfg.items() if k not in cfg}
-    if not missing:
-        return cfg
+    changed = False
 
-    log.info("Config: adding missing sections: %s", ", ".join(missing.keys()))
-    cfg.update(missing)
+    for section_key, example_section in example_cfg.items():
+        if section_key not in cfg:
+            # Whole section missing — add it
+            cfg[section_key] = example_section
+            log.info("Config: added missing section: %s", section_key)
+            changed = True
+            continue
 
-    try:
-        with open(config_path, "a") as f:
-            f.write("\n# ── Auto-added by LandNav v%s ──\n" % VERSION)
-            yaml.dump(missing, f, default_flow_style=False, sort_keys=False)
-        log.info("Config: updated %s", config_path)
-    except Exception as e:
-        log.warning("Config: could not write to file: %s (sections loaded in memory)", e)
+        # Deep-merge: add missing keys and update changed defaults
+        if isinstance(example_section, dict) and isinstance(cfg[section_key], dict):
+            live_section = cfg[section_key]
+            for key, example_val in example_section.items():
+                if key not in live_section:
+                    live_section[key] = example_val
+                    log.info("Config: %s.%s added (default: %s)",
+                             section_key, key, example_val)
+                    changed = True
+
+    # ── Version migrations: update stale defaults ──────────────
+    # v0.6.4: chisel default port changed from 443 to 8443
+    #         (443 conflicts with existing web servers on most C2 hosts)
+    if cfg.get("chisel", {}).get("server_port") == 443:
+        cfg["chisel"]["server_port"] = 8443
+        log.info("Config: migrated chisel.server_port 443 → 8443")
+        changed = True
+
+    if changed:
+        try:
+            with open(config_path, "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+            log.info("Config: updated %s", config_path)
+        except Exception as e:
+            log.warning("Config: could not write: %s (changes in memory only)", e)
 
     return cfg
 
