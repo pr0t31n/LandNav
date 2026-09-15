@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.5.8"
+VERSION = "0.6.0"
 
 import argparse
 import datetime
@@ -690,22 +690,33 @@ _AUTO_CMD_PATH = _HERE / "auto_commands.txt"
 def _generate_auto_commands(cfg: dict):
     """Rewrite auto_commands.txt based on config.
 
-    When SSH tunnels are configured, their local_port values overlap with the
-    portfwd rules in auto_commands.txt.  Metasploit's portfwd binds IPv4
-    first (AutoRunScript runs on session-open), so the SSH tunnels — started
-    later — can only get IPv6.  All IPv4 connections then go to the portfwd
-    (which is single-threaded through the meterpreter transport and unusable
-    for browsable web services).
+    When SSH tunnels or Chisel are configured, their local_port values
+    overlap with the portfwd rules in auto_commands.txt.  Metasploit's
+    portfwd binds IPv4 first (AutoRunScript runs on session-open), so the
+    tunnels — started later — can only get IPv6.  All IPv4 connections
+    then go to the portfwd (which is single-threaded through the meterpreter
+    transport and unusable for browsable web services).
 
-    Fix: strip portfwd lines whose local port matches an SSH tunnel port.
-    The SSH tunnels become the sole forwarding mechanism for those services.
-    Non-overlapping portfwd lines are preserved so the system handles mixed
-    configurations.
+    Fix: strip portfwd lines whose local port matches a tunnel port
+    (SSH or Chisel).  The tunnels become the sole forwarding mechanism for
+    those services.  Non-overlapping portfwd lines are preserved so the
+    system handles mixed configurations.
     """
-    tunnel_cfg = cfg.get("ssh_tunnels")
     tunnel_ports: set = set()
+
+    tunnel_cfg = cfg.get("ssh_tunnels")
     if tunnel_cfg:
         for fwd in tunnel_cfg.get("forwards", []):
+            lp = fwd.get("local_port")
+            if lp:
+                tunnel_ports.add(int(lp))
+
+    chisel_cfg = cfg.get("chisel", {})
+    if chisel_cfg.get("enabled", False):
+        chisel_fwds = chisel_cfg.get("forwards", [])
+        if not chisel_fwds and tunnel_cfg:
+            chisel_fwds = tunnel_cfg.get("forwards", [])
+        for fwd in chisel_fwds:
             lp = fwd.get("local_port")
             if lp:
                 tunnel_ports.add(int(lp))

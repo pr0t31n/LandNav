@@ -21,10 +21,23 @@ _DEFAULT_CONFIG = _HERE / "config.yaml"
 
 
 def generate_auto_commands(cfg):
-    tunnel_cfg = cfg.get("ssh_tunnels")
+    # Collect local ports handled by SSH tunnels OR Chisel
     tunnel_ports = set()
+
+    tunnel_cfg = cfg.get("ssh_tunnels")
     if tunnel_cfg:
         for fwd in tunnel_cfg.get("forwards", []):
+            lp = fwd.get("local_port")
+            if lp:
+                tunnel_ports.add(int(lp))
+
+    chisel_cfg = cfg.get("chisel", {})
+    if chisel_cfg.get("enabled", False):
+        # Chisel forwards — explicit list or inherited from ssh_tunnels
+        chisel_fwds = chisel_cfg.get("forwards", [])
+        if not chisel_fwds and tunnel_cfg:
+            chisel_fwds = tunnel_cfg.get("forwards", [])
+        for fwd in chisel_fwds:
             lp = fwd.get("local_port")
             if lp:
                 tunnel_ports.add(int(lp))

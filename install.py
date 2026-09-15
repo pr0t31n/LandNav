@@ -13,15 +13,18 @@ Usage:
 """
 
 import argparse
+import gzip
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.request
 from pathlib import Path
 
 TOOL_NAME = "LandNav"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 MIN_PYTHON = (3, 10)
 INSTALL_DIR = Path("/opt/pr0t31n/landnav")
 SERVICE_NAME = "landnav"
@@ -164,6 +167,132 @@ def install_pip_deps(dry_run=False):
           "--break-system-packages", "-r", str(req_file)],
          dry_run=dry_run, check=False)
 
+# ── Phase: Chisel Binary ───────────────────────────────────────
+
+# Map platform.machine() output to chisel release architecture names
+_ARCH_MAP = {
+    "aarch64":  "arm64",
+    "arm64":    "arm64",
+    "x86_64":   "amd64",
+    "amd64":    "amd64",
+    "armv7l":   "armv7",
+    "armv6l":   "armv6",
+}
+
+# Chisel release version to install — pin to a known-good version
+CHISEL_VERSION = "1.10.1"
+
+def install_chisel(dry_run=False):
+    """Download the chisel binary from GitHub releases.
+
+    Architecture-aware: detects arm64 (Pi 4/5), amd64 (c2-server/x86),
+    armv7/v6 (older Pis).  Idempotent — skips if chisel is already in
+    PATH at the correct version.
+    """
+    phase("Phase 2b: Chisel Binary")
+
+    if _has("chisel"):
+        # Check version
+        try:
+            r = subprocess.run(["chisel", "--version"], capture_output=True,
+                               text=True, check=False, timeout=5)
+            ver = r.stdout.strip() + r.stderr.strip()
+            if CHISEL_VERSION in ver:
+                info(f"chisel {CHISEL_VERSION} already installed ✓")
+                return
+            else:
+                info(f"chisel found but version mismatch ({ver.strip()}) — upgrading")
+        except Exception:
+            info("chisel found but version check failed — upgrading")
+
+    machine = platform.machine()
+    arch = _ARCH_MAP.get(machine)
+    if not arch:
+        warn(f"Unknown architecture '{machine}' — cannot download chisel")
+        warn("Install manually: go install github.com/jpillora/chisel@latest")
+        warn("  Or download from https://github.com/jpillora/chisel/releases")
+        return
+
+    sysname = platform.system().lower()
+    if sysname == "darwin":
+        os_name = "darwin"
+    else:
+        os_name = "linux"
+
+    filename = f"chisel_{CHISEL_VERSION}_{os_name}_{arch}.gz"
+    url = (f"https://github.com/jpillora/chisel/releases/download/"
+           f"v{CHISEL_VERSION}/{filename}")
+
+    dest = Path("/usr/local/bin/chisel")
+
+    if dry_run:
+        step(f"Would download {url}")
+        step(f"Would install to {dest}")
+        return
+
+    info(f"Downloading chisel {CHISEL_VERSION} for {os_name}/{arch}")
+    step(f"→ {url}")
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".gz", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        req = urllib.request.Request(url, headers={"User-Agent": "LandNav-Installer"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            tmp_path.write_bytes(resp.read())
+
+        # Decompress .gz → binary
+        with gzip.open(tmp_path, "rb") as gz_in:
+            dest.write_bytes(gz_in.read())
+
+        dest.chmod(0o755)
+        tmp_path.unlink(missing_ok=True)
+
+        # Verify
+        r = subprocess.run([str(dest), "--version"], capture_output=True,
+                           text=True, check=False, timeout=5)
+        ver = (r.stdout.strip() + r.stderr.strip()).strip()
+        info(f"chisel installed: {dest} ({ver})")
+
+    except Exception as e:
+        error(f"Failed to download chisel: {e}")
+        warn("Install manually: go install github.com/jpillora/chisel@latest")
+        warn("  Or download from https://github.com/jpillora/chisel/releases")
+        # Clean up partial download
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+# ── Phase: SSH Tunnel Keys ─────────────────────────────────────
+
+def setup_ssh_keys(dry_run=False):
+    """Generate the SSH tunnel keypair if it doesn't exist."""
+    phase("Phase 2c: SSH Tunnel Keys")
+
+    keys_dir = INSTALL_DIR / "keys"
+    key_path = keys_dir / "tunnel_key"
+
+    if key_path.exists():
+        info(f"SSH tunnel key already exists: {key_path}")
+        if not dry_run:
+            key_path.chmod(0o600)
+        return
+
+    if dry_run:
+        step(f"Would generate ed25519 keypair at {key_path}")
+        return
+
+    keys_dir.mkdir(parents=True, exist_ok=True)
+    info("Generating SSH tunnel keypair (ed25519)...")
+
+    hostname = platform.node() or "landnav"
+    _run(["ssh-keygen", "-t", "ed25519", "-f", str(key_path),
+          "-N", "", "-C", f"landnav-tunnel@{hostname}"])
+    key_path.chmod(0o600)
+    info(f"Generated: {key_path} + {key_path}.pub")
+    warn("Copy keys/ directory to the implant device (beretta)")
+    warn("Add the public key to c2-server's authorized_keys:")
+    warn(f"  cat {key_path}.pub >> ~/.ssh/authorized_keys")
+
 # ── Phase: NetworkManager Exclusion ─────────────────────────────
 
 def configure_nm_exclusion(os_name, net_backend, dry_run=False):
@@ -303,12 +432,15 @@ def verify_install():
         ("tcpdump",     _has("tcpdump")),
         ("arping",      _has("arping")),
         ("iodine",      _has("iodine")),
+        ("chisel",      _has("chisel")),
+        ("ssh-keygen",  _has("ssh-keygen")),
         ("nmap",        _has("nmap")),
         ("responder",   _has("responder") or
                         Path("/usr/share/responder/Responder.py").exists()),
         ("scapy",       _check_import("scapy")),
         ("PyYAML",      _check_import("yaml")),
         ("netifaces",   _check_import("netifaces")),
+        ("tunnel key",  (INSTALL_DIR / "keys" / "tunnel_key").exists()),
         ("config.yaml", (INSTALL_DIR / "config.yaml").exists()),
         ("systemd svc", Path(f"/etc/systemd/system/{SERVICE_NAME}.service").exists()),
     ]
@@ -383,7 +515,7 @@ def main():
     parser.add_argument("--uninstall", action="store_true",
                         help="Remove systemd service and NM config")
     parser.add_argument("--skip-go", action="store_true",
-                        help="(no-op) LandNav has no Go dependencies")
+                        help="Skip chisel binary download")
     parser.add_argument("--skip-git", action="store_true",
                         help="(no-op) LandNav has no git tool dependencies")
     args = parser.parse_args()
@@ -412,8 +544,12 @@ def main():
     if not args.skip_pip:
         install_pip_deps(dry_run=args.check)
 
+    if not args.skip_go:
+        install_chisel(dry_run=args.check)
+
     configure_nm_exclusion(os_name, net_backend, dry_run=args.check)
     setup_directories(dry_run=args.check)
+    setup_ssh_keys(dry_run=args.check)
     setup_config(dry_run=args.check)
     install_service(dry_run=args.check)
 
@@ -427,10 +563,11 @@ def main():
 
         print(f"\n  Next steps:")
         print(f"    1. Edit config:   sudo nano {INSTALL_DIR}/config.yaml")
-        print(f"    2. Set iodine password and verify C2 host")
-        print(f"    3. Test manually: sudo python3 {INSTALL_DIR}/landnav.py")
-        print(f"    4. Deploy:        sudo systemctl start landnav")
-        print(f"    5. Reboot test:   sudo reboot")
+        print(f"    2. Set chisel auth, iodine password, and verify C2 host")
+        print(f"    3. Copy keys/ directory to beretta (the implant device)")
+        print(f"    4. Test manually: sudo python3 {INSTALL_DIR}/landnav.py")
+        print(f"    5. Deploy:        sudo systemctl start landnav")
+        print(f"    6. Reboot test:   sudo reboot")
         print()
 
 if __name__ == "__main__":

