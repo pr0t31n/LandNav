@@ -43,6 +43,37 @@ meterpreter:
   # Retry delay between port attempts (seconds)
   retry_delay: 5
 
+# ── SSH Reverse Tunnels — Service Access ──────────────────────
+# After meterpreter establishes, SSH reverse tunnels are started
+# independently to provide reliable access to internal services.
+# Meterpreter's single-threaded transport starves under web/TLS
+# traffic — SSH tunnels bypass this entirely with native TCP
+# multiplexing over a separate connection.
+#
+# Requires:
+#   1. SSH key pair: deploy script generates keys/tunnel_key{,.pub}
+#   2. Public key in c2-server's authorized_keys (restrict=tunnel-only)
+#   3. SSH binary available on the target (beretta)
+ssh_tunnels:
+  # Path to SSH private key on the target device (beretta)
+  key_path: /opt/pr0t31n/LandNav/keys/tunnel_key
+  # SSH port on the C2 server
+  ssh_port: 22
+  # SSH user on the C2 server
+  ssh_user: root
+  # Port forwards: c2-server_port → target_host:target_port
+  # Each entry creates an SSH -R reverse forward
+  forwards:
+    - local_port: 25100       # c2-server:25100 → beretta:5100 (Vantage)
+      remote_port: 5100
+      remote_host: 10.10.240.61
+    - local_port: 25500       # c2-server:25500 → beretta:5500 (Crucible)
+      remote_port: 5500
+      remote_host: 10.10.240.61
+    - local_port: 28834       # c2-server:28834 → beretta:8834 (Nessus)
+      remote_port: 8834
+      remote_host: 10.10.240.61
+
 # ── Network — Bridge & Discovery ───────────────────────────────
 network:
   bridge:

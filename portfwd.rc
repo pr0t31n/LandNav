@@ -1,12 +1,13 @@
 # LandNav port forwards — run after session opens
 # Usage: resource /opt/pr0t31n/LandNav/portfwd.rc
 #
-# Forwards beretta services to c2-server high ports (c2-server already
-# hosts Vantage/Crucible/Nessus locally on the standard ports).
+# Forwards beretta services to c2-server high ports.
+# Uses beretta's bridge IP (not 127.0.0.1) since services may
+# not bind to loopback.
 
-sessions -c "portfwd add -l 25100 -p 5100 -r 127.0.0.1"
-sessions -c "portfwd add -l 25500 -p 5500 -r 127.0.0.1"
-sessions -c "portfwd add -l 28834 -p 8834 -r 127.0.0.1"
+sessions -c "portfwd add -l 25100 -p 5100 -r 10.10.240.61"
+sessions -c "portfwd add -l 25500 -p 5500 -r 10.10.240.61"
+sessions -c "portfwd add -l 28834 -p 8834 -r 10.10.240.61"
 
 echo ""
 echo "Port forwards active:"

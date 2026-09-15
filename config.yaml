@@ -115,3 +115,19 @@ logging:
   max_size_mb: 50      # Rotate logs after this size
   # Log to console as well (useful for manual testing; disabled in service mode)
   console: true
+
+# ── SSH Reverse Tunnels (added by v0.5.5 deploy) ─────────────
+ssh_tunnels:
+  key_path: /opt/pr0t31n/LandNav/keys/tunnel_key
+  ssh_port: 22
+  ssh_user: root
+  forwards:
+    - local_port: 25100
+      remote_port: 5100
+      remote_host: 10.10.240.61
+    - local_port: 25500
+      remote_port: 5500
+      remote_host: 10.10.240.61
+    - local_port: 28834
+      remote_port: 8834
+      remote_host: 10.10.240.61
