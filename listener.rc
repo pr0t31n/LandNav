@@ -24,12 +24,20 @@ if File.exist?(CONFIG_PATH)
   cfg = YAML.safe_load(File.read(CONFIG_PATH)) || {}
 end
 
-# ── 1. Strip portfwd lines that overlap with SSH tunnels ──────
+# ── 1. Config sync + portfwd stripping ───────────────────────
+# prep_handler.py now also merges missing config sections from
+# config.yaml.example and applies version migrations (e.g. chisel
+# port 443→8443).  Re-read config afterward so later sections
+# (chisel server, iodined) use the updated values.
 prep = "#{LANDNAV_DIR}/prep_handler.py"
 if File.exist?(prep)
   ret = system("python3 #{prep} -c #{CONFIG_PATH} 2>/dev/null")
   if ret
     print_line("[*] auto_commands.txt prepared (SSH-tunnel portfwd stripped)")
+    # Re-read config — prep_handler.py may have migrated values
+    if File.exist?(CONFIG_PATH)
+      cfg = YAML.safe_load(File.read(CONFIG_PATH)) || {}
+    end
   else
     print_line("[!] prep_handler.py failed — using auto_commands.txt as-is")
   end
@@ -113,7 +121,7 @@ if chisel_cfg.fetch('enabled', false)
     if system("pgrep -xf 'chisel server' >/dev/null 2>&1")
       print_line("[*] Chisel server already running ✓")
     else
-      chisel_port = chisel_cfg['server_port'] || 443
+      chisel_port = chisel_cfg['server_port'] || 8443
       chisel_auth = chisel_cfg['auth'] || ''
       chisel_tls = chisel_cfg.fetch('tls', true)
 

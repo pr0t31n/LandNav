@@ -20,6 +20,57 @@ _AUTO_CMD_PATH = _HERE / "auto_commands.txt"
 _DEFAULT_CONFIG = _HERE / "config.yaml"
 
 
+def ensure_config_current(cfg, config_path):
+    """Sync c2-server's config with config.yaml.example defaults.
+
+    Mirrors the logic in landnav.py — adds missing sections/keys and
+    applies version migrations so c2-server's listener.rc reads correct
+    values without manual edits.
+    """
+    example_path = _HERE / "config.yaml.example"
+    if not example_path.exists():
+        return cfg
+
+    try:
+        with open(example_path) as f:
+            example_cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return cfg
+
+    changed = False
+
+    for section_key, example_section in example_cfg.items():
+        if section_key not in cfg:
+            cfg[section_key] = example_section
+            print("  config: added missing section: %s" % section_key)
+            changed = True
+            continue
+
+        if isinstance(example_section, dict) and isinstance(cfg[section_key], dict):
+            for key, example_val in example_section.items():
+                if key not in cfg[section_key]:
+                    cfg[section_key][key] = example_val
+                    print("  config: %s.%s added (default: %s)" % (
+                        section_key, key, example_val))
+                    changed = True
+
+    # v0.6.5 migration: chisel default port 443 → 8443
+    if cfg.get("chisel", {}).get("server_port") == 443:
+        cfg["chisel"]["server_port"] = 8443
+        print("  config: migrated chisel.server_port 443 → 8443")
+        changed = True
+
+    if changed:
+        try:
+            with open(config_path, "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+            print("  config: updated %s" % config_path)
+        except Exception as e:
+            print("  config: could not write: %s" % e)
+
+    return cfg
+
+
 def generate_auto_commands(cfg):
     # Collect local ports handled by SSH tunnels OR Chisel
     tunnel_ports = set()
@@ -84,4 +135,5 @@ if __name__ == "__main__":
     with open(config_path) as f:
         cfg = yaml.safe_load(f) or {}
 
+    cfg = ensure_config_current(cfg, config_path)
     generate_auto_commands(cfg)
