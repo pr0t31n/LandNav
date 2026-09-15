@@ -4,7 +4,8 @@
 # Starts a python/meterpreter/reverse_tcp handler on :4443.
 # On session open, automatically:
 #   1. Adds routes for all subnets (autoroute)
-#   2. Port-forwards Vantage (5100), Crucible (5500), Nessus (8834)
+#   2. Port-forwards beretta services to c2-server high ports
+#      (c2-server hosts its own Vantage/Crucible/Nessus on the standard ports)
 #
 # SOCKS proxy is available on :1080 but prefer the port forwards —
 # Python meterpreter is single-threaded and heavy SOCKS browsing
@@ -46,11 +47,11 @@ echo " Waiting for beretta call-home..."
 echo ""
 echo " On session open, auto-runs:"
 echo "   • autoroute (all subnets)"
-echo "   • portfwd 5100 → beretta:5100 (Vantage)"
-echo "   • portfwd 5500 → beretta:5500 (Crucible)"
-echo "   • portfwd 8834 → beretta:8834 (Nessus)"
+echo "   • portfwd 25100 → beretta:5100 (Vantage)"
+echo "   • portfwd 25500 → beretta:5500 (Crucible)"
+echo "   • portfwd 28834 → beretta:8834 (Nessus)"
 echo ""
-echo " Browse: http://c2-server:5100  http://c2-server:5500"
-echo "         https://c2-server:8834"
+echo " Browse: http://c2-server:25100  http://c2-server:25500"
+echo "         https://c2-server:28834"
 echo "════════════════════════════════════════════════════"
 echo ""

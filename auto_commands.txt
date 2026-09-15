@@ -1,4 +1,4 @@
 run post/multi/manage/autoroute SUBNET=0.0.0.0 NETMASK=0.0.0.0
-portfwd add -l 5100 -p 5100 -r 127.0.0.1
-portfwd add -l 5500 -p 5500 -r 127.0.0.1
-portfwd add -l 8834 -p 8834 -r 127.0.0.1
+portfwd add -l 25100 -p 5100 -r 127.0.0.1
+portfwd add -l 25500 -p 5500 -r 127.0.0.1
+portfwd add -l 28834 -p 8834 -r 127.0.0.1
