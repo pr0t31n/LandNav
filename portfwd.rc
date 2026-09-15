@@ -1,0 +1,17 @@
+# LandNav port forwards — run after session opens
+# Usage: resource /opt/pr0t31n/LandNav/portfwd.rc
+#
+# Forwards beretta services to c2-server local ports.
+# Prefer this over SOCKS for specific services — Python meterpreter's
+# single-threaded transport can't handle heavy SOCKS + commands.
+
+sessions -c "portfwd add -l 5100 -p 5100 -r 127.0.0.1"
+sessions -c "portfwd add -l 5500 -p 5500 -r 127.0.0.1"
+sessions -c "portfwd add -l 8834 -p 8834 -r 127.0.0.1"
+
+echo ""
+echo "Port forwards active:"
+echo "  c2-server:5100 → beretta:5100 (Vantage)"
+echo "  c2-server:5500 → beretta:5500 (Crucible)"
+echo "  c2-server:8834 → beretta:8834 (Nessus)"
+echo ""

