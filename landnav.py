@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.6.10"
+VERSION = "0.7.0"
 
 import argparse
 import datetime
@@ -176,9 +176,11 @@ def phase_detect_interfaces(cfg):
     """
     log.info("════════ Phase 1: Interface Detection ════════")
 
-    # ── Step 1: Check for existing system-managed bridge ───────
-    # If br0 (or another bridge) already exists with connectivity,
-    # LandNav should use it rather than destroying and recreating.
+    # ── Step 1: Note existing bridges (informational) ──────────
+    system_bridge_usable = False
+    system_bridge_uplink = None
+    system_bridge_downstream = None
+
     if netconfig.interface_exists(bridge.BRIDGE_NAME):
         br_info = netconfig.get_interface_info(bridge.BRIDGE_NAME)
         br_members = netconfig.get_bridge_ports(bridge.BRIDGE_NAME)
@@ -188,16 +190,9 @@ def phase_detect_interfaces(cfg):
                  br_members, is_system)
 
         if is_system and br_info["ip"] and br_info["state"] == "UP":
-            log.info("System-managed bridge %s is UP with IP %s — using it directly",
-                     bridge.BRIDGE_NAME, br_info["ip"])
-            # Identify which member is the uplink (has carrier to the network)
-            uplink = br_members[0] if br_members else None
-            return {
-                "mode": "bridge-reuse",
-                "uplink": uplink,
-                "downstream": br_members[1] if len(br_members) > 1 else None,
-                "existing_bridge": True,
-            }
+            system_bridge_usable = True
+            system_bridge_uplink = br_members[0] if br_members else None
+            system_bridge_downstream = br_members[1] if len(br_members) > 1 else None
 
     # ── Step 2: Detect physical ethernet interfaces ────────────
     ifaces = netconfig.detect_interfaces()
@@ -216,19 +211,27 @@ def phase_detect_interfaces(cfg):
 
     if not netconfig.interface_has_carrier(uplink):
         log.warning("%s has no carrier — cable may not be connected", uplink)
-        # Continue anyway — cable might be connected after boot
 
     bridge_cfg = cfg.get("network", {}).get("bridge", {})
 
+    # USB-ethernet takes priority — create our own bridge (auto-names
+    # around any system-managed brN that already exists)
     if usb_eth and bridge_cfg.get("auto_detect", True):
         log.info("USB-ethernet detected (%s) — BRIDGE mode", usb_eth)
         netconfig.set_interface_up(usb_eth)
         return {"mode": "bridge", "uplink": uplink, "downstream": usb_eth,
                 "existing_bridge": False}
-    else:
-        log.info("No USB-ethernet — STANDALONE mode on %s", uplink)
-        return {"mode": "standalone", "uplink": uplink, "downstream": None,
-                "existing_bridge": False}
+
+    # No USB-ethernet — fall back to system bridge if available
+    if system_bridge_usable:
+        log.info("No USB-ethernet but system bridge %s is usable — reusing",
+                 bridge.BRIDGE_NAME)
+        return {"mode": "bridge-reuse", "uplink": system_bridge_uplink,
+                "downstream": system_bridge_downstream, "existing_bridge": True}
+
+    log.info("No USB-ethernet — STANDALONE mode on %s", uplink)
+    return {"mode": "standalone", "uplink": uplink, "downstream": None,
+            "existing_bridge": False}
 
 # ── Phase 2: Network Setup ─────────────────────────────────────
 

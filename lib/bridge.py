@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Transparent bridge manager.
 
-Creates a Linux bridge (br0) between the onboard ethernet (uplink to
-the network) and a USB-ethernet adapter (downstream to the legitimate
+Creates a Linux bridge between the onboard ethernet (uplink to the
+network) and a USB-ethernet adapter (downstream to the legitimate
 device).  The bridge forwards all frames transparently so the switch
 sees only the legitimate device's MAC.
 
-The Pi can also assign itself an IP on br0 for C2 and attack traffic.
+The bridge name is auto-detected at runtime — if br0 is already
+occupied by a system-managed bridge, LandNav tries br1, br2, etc.
+until it finds an available name.
+
 ebtables SNAT rewrites the Pi's outgoing MAC to match the legitimate
 device, achieving full Layer-2 invisibility.
 """
@@ -40,10 +43,27 @@ def _has(binary):
 # destroy_bridge() refuses to touch a bridge without it.
 _LANDNAV_BRIDGE_MARKER = Path("/var/run/landnav_bridge_managed")
 
+# ── Bridge nf-call ──────────────────────────────────────────────
+
+def _disable_bridge_nf_call():
+    """Prevent iptables from filtering bridged L2 frames.
+
+    Without this, Kali's default iptables FORWARD DROP policy silently
+    drops frames traversing the bridge — the downstream device loses
+    all network access.
+    """
+    _run(["modprobe", "br_netfilter"], check=False)
+    for param in (
+        "net.bridge.bridge-nf-call-iptables",
+        "net.bridge.bridge-nf-call-ip6tables",
+        "net.bridge.bridge-nf-call-arptables",
+    ):
+        _run(["sysctl", "-w", f"{param}=0"], check=False)
+
 # ── Bridge Lifecycle ────────────────────────────────────────────
 
 def _existing_bridge_usable(uplink, downstream):
-    """Check if br0 already exists with the ports we need and has connectivity.
+    """Check if BRIDGE_NAME already exists with the ports we need.
 
     Returns:
         "usable"     — bridge exists, has IP, has our ports — use as-is
@@ -76,13 +96,13 @@ def _existing_bridge_usable(uplink, downstream):
 
 
 def create_bridge(uplink, downstream, stp=False):
-    """Create br0 bridging uplink (wall port) and downstream (legit device).
+    """Create a bridge between uplink (wall port) and downstream (legit device).
 
-    Checks for an existing bridge first:
-      - System-managed bridge (defined in /etc/network/interfaces, NM, netplan):
-        NEVER destroyed — LandNav uses it as-is or falls back to standalone.
-      - Existing LandNav bridge with correct ports: reused without recreation.
-      - Stale LandNav bridge with wrong ports: destroyed and recreated.
+    Auto-detects an available bridge name — if br0 is occupied by a
+    system-managed bridge, tries br1, br2, etc. up to br255.
+
+    After creation, disables bridge-nf-call-iptables so the kernel's
+    iptables FORWARD chain does not drop bridged L2 frames.
 
     Args:
         uplink:     Interface name connected to the wall (e.g. eth0)
@@ -92,18 +112,31 @@ def create_bridge(uplink, downstream, stp=False):
     Returns:
         True on success, False on failure.
     """
+    global BRIDGE_NAME
+
+    # ── Auto-detect available bridge name ─────────────────────
+    for i in range(256):
+        candidate = f"br{i}"
+        if not netconfig.interface_exists(candidate):
+            BRIDGE_NAME = candidate
+            break
+        if not netconfig.is_system_managed_bridge(candidate):
+            BRIDGE_NAME = candidate
+            break
+        log.info("br%d is system-managed — skipping", i)
+    else:
+        log.error("No available bridge name (br0-br255 all system-managed)")
+        return False
+
     log.info("Creating bridge %s: %s (uplink) + %s (downstream)",
              BRIDGE_NAME, uplink, downstream)
 
-    # ── Check for existing bridge ──────────────────────────────
+    # ── Check for existing bridge with this name ──────────────
     status = _existing_bridge_usable(uplink, downstream)
 
     if status == "foreign":
-        log.warning("System-managed bridge %s exists — LandNav will NOT destroy it. "
-                    "The existing bridge will be used for sniffing. If you need "
-                    "LandNav to create its own bridge, use a different bridge name "
-                    "or remove the system bridge definition first.", BRIDGE_NAME)
-        # Enable promiscuous mode for packet capture on the existing bridge
+        log.warning("Bridge %s exists but is unmanaged with wrong ports — "
+                    "enabling promiscuous mode as fallback", BRIDGE_NAME)
         try:
             netconfig.set_interface_promisc(BRIDGE_NAME, True)
         except Exception:
@@ -118,6 +151,7 @@ def create_bridge(uplink, downstream, stp=False):
         except Exception:
             pass
         _LANDNAV_BRIDGE_MARKER.write_text(str(os.getpid()))
+        _disable_bridge_nf_call()
         return True
 
     if status == "compatible":
@@ -128,6 +162,7 @@ def create_bridge(uplink, downstream, stp=False):
             netconfig.set_interface_up(downstream)
             netconfig.set_interface_promisc(BRIDGE_NAME, True)
             _LANDNAV_BRIDGE_MARKER.write_text(str(os.getpid()))
+            _disable_bridge_nf_call()
             log.info("Downstream %s added to existing bridge", downstream)
             return True
         except subprocess.CalledProcessError as e:
@@ -167,6 +202,9 @@ def create_bridge(uplink, downstream, stp=False):
         # Enable promiscuous mode for packet capture
         netconfig.set_interface_promisc(BRIDGE_NAME, True)
 
+        # Disable iptables on bridged frames
+        _disable_bridge_nf_call()
+
         # Mark this bridge as LandNav-managed
         _LANDNAV_BRIDGE_MARKER.write_text(str(os.getpid()))
 
@@ -182,7 +220,7 @@ def create_bridge(uplink, downstream, stp=False):
 
 
 def destroy_bridge():
-    """Tear down br0 and release member interfaces.
+    """Tear down the LandNav bridge and release member interfaces.
 
     SAFETY: Refuses to destroy a system-managed bridge (defined in
     /etc/network/interfaces, NetworkManager, or netplan).  Only destroys
@@ -219,7 +257,7 @@ def destroy_bridge():
 
 
 def bridge_is_up():
-    """Check if br0 exists and is UP."""
+    """Check if the LandNav bridge exists and is UP."""
     if not netconfig.interface_exists(BRIDGE_NAME):
         return False
     info = netconfig.get_interface_info(BRIDGE_NAME)
