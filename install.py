@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 TOOL_NAME = "LandNav"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 MIN_PYTHON = (3, 10)
 INSTALL_DIR = Path("/opt/pr0t31n/landnav")
 SERVICE_NAME = "landnav"
