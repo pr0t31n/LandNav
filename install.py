@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 TOOL_NAME = "LandNav"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MIN_PYTHON = (3, 10)
 INSTALL_DIR = Path("/opt/pr0t31n/landnav")
 SERVICE_NAME = "landnav"
@@ -332,37 +332,55 @@ unmanaged-devices=interface-name:eth*;interface-name:enx*;interface-name:usb*;in
 
 # ── Phase: systemd Service ──────────────────────────────────────
 
+def _find_unit(name):
+    """Locate a systemd unit file in the repo (systemd/ subdir or repo root)."""
+    for base in (INSTALL_DIR, Path(__file__).resolve().parent):
+        for sub in (base / "systemd" / name, base / name):
+            if sub.exists():
+                return sub
+    return None
+
 def install_service(dry_run=False):
-    phase("Phase 4: systemd Service")
+    phase("Phase 4: systemd Service + Watchdog")
 
     if not _has("systemctl"):
         warn("systemd not found — cannot install boot service")
         warn("You'll need to start LandNav manually: python3 landnav.py")
         return
 
-    src = INSTALL_DIR / "systemd" / "landnav.service"
-    if not src.exists():
-        src = Path(__file__).resolve().parent / "systemd" / "landnav.service"
-
-    dst = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
+    units = [
+        ("landnav.service",            True),
+        ("landnav-watchdog.service",   False),
+        ("landnav-watchdog.timer",     False),
+    ]
 
     if dry_run:
-        step(f"Would copy {src} → {dst}")
-        step("Would enable and start landnav.service")
+        for name, _ in units:
+            step(f"Would install /etc/systemd/system/{name}")
+        step("Would enable and start landnav.service + landnav-watchdog.timer")
         return
 
-    if not src.exists():
-        error(f"Service file not found: {src}")
-        return
+    installed = []
+    for name, _ in units:
+        src = _find_unit(name)
+        if not src:
+            error(f"Unit file not found: {name}")
+            continue
+        dst = Path(f"/etc/systemd/system/{name}")
+        info(f"Installing: {dst}")
+        shutil.copy2(src, dst)
+        dst.chmod(0o644)
+        installed.append(name)
 
-    info(f"Installing service: {dst}")
-    shutil.copy2(src, dst)
-    dst.chmod(0o644)
+    if not installed:
+        error("No unit files installed — cannot continue")
+        return
 
     _run(["systemctl", "daemon-reload"])
-    _run(["systemctl", "enable", SERVICE_NAME])
-    info(f"Service '{SERVICE_NAME}' enabled — will start on next boot")
-    info("To start now: sudo systemctl start landnav")
+    _run(["systemctl", "enable", "--now", SERVICE_NAME])
+    _run(["systemctl", "enable", "--now", "landnav-watchdog.timer"])
+    info("landnav.service enabled and started")
+    info("landnav-watchdog.timer enabled and started (checks every 2 minutes)")
     info("To check status: sudo systemctl status landnav")
     info("To view logs: sudo journalctl -u landnav -f")
 
@@ -443,6 +461,7 @@ def verify_install():
         ("tunnel key",  (INSTALL_DIR / "keys" / "tunnel_key").exists()),
         ("config.yaml", (INSTALL_DIR / "config.yaml").exists()),
         ("systemd svc", Path(f"/etc/systemd/system/{SERVICE_NAME}.service").exists()),
+        ("watchdog timer", Path("/etc/systemd/system/landnav-watchdog.timer").exists()),
     ]
 
     all_ok = True
@@ -467,19 +486,26 @@ def _check_import(module):
 def uninstall(dry_run=False):
     phase("Uninstalling LandNav")
 
-    svc = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
+    unit_files = [
+        Path(f"/etc/systemd/system/{SERVICE_NAME}.service"),
+        Path("/etc/systemd/system/landnav-watchdog.service"),
+        Path("/etc/systemd/system/landnav-watchdog.timer"),
+    ]
     nm_conf = Path("/etc/NetworkManager/conf.d/landnav-unmanage.conf")
 
     if _has("systemctl"):
+        _run(["systemctl", "stop", "landnav-watchdog.timer"], check=False, dry_run=dry_run)
+        _run(["systemctl", "disable", "landnav-watchdog.timer"], check=False, dry_run=dry_run)
         _run(["systemctl", "stop", SERVICE_NAME], check=False, dry_run=dry_run)
         _run(["systemctl", "disable", SERVICE_NAME], check=False, dry_run=dry_run)
 
-    if svc.exists():
-        if dry_run:
-            step(f"Would remove {svc}")
-        else:
-            svc.unlink()
-            info(f"Removed {svc}")
+    for uf in unit_files:
+        if uf.exists():
+            if dry_run:
+                step(f"Would remove {uf}")
+            else:
+                uf.unlink()
+                info(f"Removed {uf}")
 
     if nm_conf.exists():
         if dry_run:
@@ -492,7 +518,7 @@ def uninstall(dry_run=False):
     if _has("systemctl"):
         _run(["systemctl", "daemon-reload"], check=False, dry_run=dry_run)
 
-    info("LandNav service removed. Files in /opt/pr0t31n/landnav/ left intact.")
+    info("LandNav services removed. Files in /opt/pr0t31n/landnav/ left intact.")
     info("To fully remove: sudo rm -rf /opt/pr0t31n/landnav/")
 
 # ── Main ────────────────────────────────────────────────────────

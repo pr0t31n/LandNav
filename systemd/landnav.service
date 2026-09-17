@@ -1,30 +1,17 @@
 [Unit]
-Description=LandNav — Rogue device network bootstrapper
-Documentation=https://github.com/pr0t31n/LandNav
-After=network-pre.target systemd-networkd-wait-online.service
-Before=network.target
-Wants=network-pre.target
+Description=LandNav Network Bootstrapper
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/pr0t31n/landnav/landnav.py --config /opt/pr0t31n/landnav/config.yaml
-WorkingDirectory=/opt/pr0t31n/landnav
+ExecStart=/usr/bin/python3 /opt/pr0t31n/LandNav/landnav.py
+WorkingDirectory=/opt/pr0t31n/LandNav
 Restart=on-failure
-RestartSec=15
+RestartSec=30
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=landnav
-
-# Run before NetworkManager so LandNav controls the interfaces
-# rather than NM fighting over them
-ExecStartPre=/bin/sleep 5
-
-# Security — still need root for raw sockets, bridge, ebtables
-User=root
-Group=root
-
-# Prevent NM from managing our interfaces while LandNav runs
-Environment=NM_MANAGED=0
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
