@@ -483,6 +483,63 @@ def _check_import(module):
 
 # ── Uninstall ───────────────────────────────────────────────────
 
+def _is_system_managed_bridge(name):
+    """Check if a bridge is managed by the system (not by LandNav)."""
+    for cfg in ("/etc/network/interfaces",):
+        try:
+            if name in Path(cfg).read_text():
+                return True
+        except (FileNotFoundError, PermissionError):
+            pass
+    try:
+        for f in Path("/etc/netplan").glob("*.yaml"):
+            if name in f.read_text():
+                return True
+    except (FileNotFoundError, PermissionError):
+        pass
+    if _has("nmcli"):
+        try:
+            r = subprocess.run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"],
+                              capture_output=True, text=True, check=False, timeout=5)
+            for line in r.stdout.splitlines():
+                if line.startswith(f"{name}:bridge"):
+                    return True
+        except Exception:
+            pass
+    return False
+
+def _cleanup_landnav_bridges(dry_run=False):
+    """Remove non-system bridges (br1-br255) that LandNav may have created."""
+    sysfs = Path("/sys/class/net")
+    cleaned = 0
+    for i in range(1, 256):
+        name = f"br{i}"
+        bridge_dir = sysfs / name / "bridge"
+        if not bridge_dir.is_dir():
+            continue
+        if _is_system_managed_bridge(name):
+            continue
+        brif = sysfs / name / "brif"
+        members = list(brif.iterdir()) if brif.is_dir() else []
+        member_names = [m.name for m in members]
+        if dry_run:
+            step(f"Would remove bridge {name} (members: {member_names})")
+            cleaned += 1
+            continue
+        info(f"Removing bridge {name} (members: {member_names})")
+        for m in member_names:
+            _run(["ip", "link", "set", m, "nomaster"], check=False)
+        _run(["ip", "link", "set", name, "down"], check=False)
+        _run(["ip", "link", "del", name], check=False)
+        cleaned += 1
+    marker = Path("/var/run/landnav_bridge_managed")
+    if marker.exists() and not dry_run:
+        marker.unlink()
+    if cleaned:
+        info(f"Cleaned {cleaned} LandNav bridge(s)")
+    else:
+        info("No LandNav bridges found")
+
 def uninstall(dry_run=False):
     phase("Uninstalling LandNav")
 
@@ -506,6 +563,8 @@ def uninstall(dry_run=False):
             else:
                 uf.unlink()
                 info(f"Removed {uf}")
+
+    _cleanup_landnav_bridges(dry_run=dry_run)
 
     if nm_conf.exists():
         if dry_run:
