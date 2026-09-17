@@ -370,6 +370,26 @@ def get_downstream_mac(downstream_iface, timeout=30):
 
 # ── Bridge IP Configuration ─────────────────────────────────────
 
+def add_port(iface):
+    """Add an interface as a new port on the current bridge.
+
+    Used when a system-managed bridge already has the uplink and
+    connectivity — the downstream (USB-ethernet) is added to it
+    so the connected device gets transparent L2 access.
+    """
+    log.info("Adding %s to bridge %s", iface, BRIDGE_NAME)
+    try:
+        _run(["ip", "link", "set", iface, "master", BRIDGE_NAME])
+        netconfig.set_interface_up(iface)
+        netconfig.set_interface_promisc(BRIDGE_NAME, True)
+        _disable_bridge_nf_call()
+        log.info("Port %s added to bridge %s", iface, BRIDGE_NAME)
+        return True
+    except subprocess.CalledProcessError as e:
+        log.error("Failed to add %s to bridge %s: %s", iface, BRIDGE_NAME, e.stderr)
+        return False
+
+
 def configure_bridge_ip(ip, cidr, gateway, dns_servers=None, domain=None):
     """Assign the Pi its own IP on the bridge for C2 and attack traffic.
 

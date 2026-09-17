@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 import argparse
 import datetime
@@ -176,11 +176,10 @@ def phase_detect_interfaces(cfg):
     """
     log.info("════════ Phase 1: Interface Detection ════════")
 
-    # ── Step 1: Note existing bridges (informational) ──────────
-    system_bridge_usable = False
-    system_bridge_uplink = None
-    system_bridge_downstream = None
-
+    # ── Step 1: Check for existing system-managed bridge ───────
+    # If a system bridge already has the uplink and connectivity,
+    # LandNav adds the USB-ethernet downstream to it rather than
+    # creating a separate bridge (the uplink can't be in two bridges).
     if netconfig.interface_exists(bridge.BRIDGE_NAME):
         br_info = netconfig.get_interface_info(bridge.BRIDGE_NAME)
         br_members = netconfig.get_bridge_ports(bridge.BRIDGE_NAME)
@@ -190,9 +189,28 @@ def phase_detect_interfaces(cfg):
                  br_members, is_system)
 
         if is_system and br_info["ip"] and br_info["state"] == "UP":
-            system_bridge_usable = True
-            system_bridge_uplink = br_members[0] if br_members else None
-            system_bridge_downstream = br_members[1] if len(br_members) > 1 else None
+            # System bridge is live — find any non-bridge-member ethernet
+            # to add as a downstream port
+            ifaces = netconfig.detect_interfaces()
+            log.info("Detected physical interfaces: %s", ifaces)
+            downstream = None
+            for eth in ifaces.get("all_eth", []):
+                if eth not in br_members:
+                    downstream = eth
+                    break
+            if downstream:
+                log.info("System bridge %s is UP — adding downstream %s to it",
+                         bridge.BRIDGE_NAME, downstream)
+                netconfig.set_interface_up(downstream)
+            else:
+                log.info("System bridge %s is UP — no additional downstream found",
+                         bridge.BRIDGE_NAME)
+            return {
+                "mode": "bridge-reuse",
+                "uplink": br_members[0] if br_members else None,
+                "downstream": downstream,
+                "existing_bridge": True,
+            }
 
     # ── Step 2: Detect physical ethernet interfaces ────────────
     ifaces = netconfig.detect_interfaces()
@@ -205,7 +223,6 @@ def phase_detect_interfaces(cfg):
         log.error("No onboard ethernet interface found")
         return None
 
-    # Check for physical link on uplink
     netconfig.set_interface_up(uplink)
     time.sleep(2)
 
@@ -214,20 +231,11 @@ def phase_detect_interfaces(cfg):
 
     bridge_cfg = cfg.get("network", {}).get("bridge", {})
 
-    # USB-ethernet takes priority — create our own bridge (auto-names
-    # around any system-managed brN that already exists)
-    if usb_eth and bridge_cfg.get("auto_detect", True):
+    if usb_eth and usb_eth != uplink and bridge_cfg.get("auto_detect", True):
         log.info("USB-ethernet detected (%s) — BRIDGE mode", usb_eth)
         netconfig.set_interface_up(usb_eth)
         return {"mode": "bridge", "uplink": uplink, "downstream": usb_eth,
                 "existing_bridge": False}
-
-    # No USB-ethernet — fall back to system bridge if available
-    if system_bridge_usable:
-        log.info("No USB-ethernet but system bridge %s is usable — reusing",
-                 bridge.BRIDGE_NAME)
-        return {"mode": "bridge-reuse", "uplink": system_bridge_uplink,
-                "downstream": system_bridge_downstream, "existing_bridge": True}
 
     log.info("No USB-ethernet — STANDALONE mode on %s", uplink)
     return {"mode": "standalone", "uplink": uplink, "downstream": None,
@@ -254,18 +262,34 @@ def phase_network_setup(iface_info, cfg):
     downstream = iface_info["downstream"]
 
     if mode == "bridge-reuse":
-        return _setup_bridge_reuse_mode(net_cfg)
+        return _setup_bridge_reuse_mode(net_cfg, iface_info)
     elif mode == "bridge":
         return _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg)
     else:
         return _setup_standalone_mode(uplink, net_cfg, disc_cfg)
 
 
-def _setup_bridge_reuse_mode(net_cfg):
-    """Use an existing system-managed bridge that already has connectivity."""
+def _setup_bridge_reuse_mode(net_cfg, iface_info):
+    """Use an existing system-managed bridge that already has connectivity.
+
+    If iface_info includes a downstream interface (USB-ethernet), it is
+    added to the system bridge so the connected device gets transparent
+    L2 access to the network.
+    """
     import re as _re
     br_info = netconfig.get_interface_info(bridge.BRIDGE_NAME)
     log.info("Using existing bridge %s: IP=%s", bridge.BRIDGE_NAME, br_info["ip"])
+
+    # Add downstream to the existing bridge if present
+    downstream = iface_info.get("downstream")
+    if downstream:
+        if bridge.add_port(downstream):
+            log.info("Downstream %s added to system bridge %s — "
+                     "connected device has transparent network access",
+                     downstream, bridge.BRIDGE_NAME)
+        else:
+            log.warning("Failed to add downstream %s to bridge — "
+                        "connected device will NOT have network access", downstream)
 
     config = discovery.NetworkConfig()
     config.ip = br_info["ip"]
