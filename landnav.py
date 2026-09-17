@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.9.0"
+VERSION = "0.11.0"
 
 import argparse
 import datetime
@@ -358,6 +358,20 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
     """Bridge mode network setup."""
     bridge_cfg = net_cfg.get("bridge", {})
 
+    # ── Pre-bridge MAC clone (port security bypass) ──────────────
+    # Detect the legitimate device's MAC BEFORE creating the bridge
+    # or sending any traffic upstream.  Clone it onto the uplink
+    # interface so the switch only ever sees one MAC on the port.
+    legit_mac = None
+    if bridge_cfg.get("mac_transparency", True):
+        legit_mac = bridge.sniff_downstream_mac(
+            downstream, timeout=disc_cfg.get("dhcp_timeout", 30))
+        if legit_mac:
+            bridge.clone_mac(uplink, legit_mac)
+        else:
+            log.warning("Could not detect downstream MAC — port security "
+                        "may block connectivity")
+
     led.set_state(led.BRIDGE_UP)
     if not bridge.create_bridge(uplink, downstream, stp=bridge_cfg.get("stp", False)):
         log.error("Bridge creation failed — falling back to standalone")
@@ -366,8 +380,9 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
     log.info("Bridge active — sniffing for legitimate device traffic")
     led.set_state(led.DISCOVERY)
 
-    legit_mac = bridge.get_downstream_mac(downstream,
-                                           timeout=disc_cfg.get("dhcp_timeout", 30))
+    if not legit_mac:
+        legit_mac = bridge.get_downstream_mac(downstream,
+                                               timeout=disc_cfg.get("dhcp_timeout", 30))
 
     net_config = discovery.sniff_dhcp(
         bridge.BRIDGE_NAME,

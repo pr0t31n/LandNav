@@ -118,15 +118,15 @@ end
 chisel_cfg = cfg['chisel'] || {}
 if chisel_cfg.fetch('enabled', false)
   if system("command -v chisel >/dev/null 2>&1")
-      chisel_port = chisel_cfg['server_port'] || 8443
+      chisel_port = chisel_cfg['server_port'] || 443
       chisel_auth = chisel_cfg['auth'] || ''
       chisel_tls = chisel_cfg.fetch('tls', true)
       chisel_ok = true   # assume we can start; gates below may flip this
 
       # ── Port conflict detection ──────────────────────────────
       # Check if anything is already listening on the target port.
-      # If it's a stale chisel, kill it.  If it's something else,
-      # give up — don't fight another service for the port.
+      # If it's a stale chisel, kill it.  If it's MeshCentral (the
+      # expected occupant on :443), stop it via systemd.
       port_pid = `ss -tlnp sport = :#{chisel_port} 2>/dev/null`
                    .scan(/pid=(\d+)/).flatten.first
       if port_pid
@@ -135,15 +135,26 @@ if chisel_cfg.fetch('enabled', false)
           print_line("[*] Killing stale chisel (pid #{port_pid}) on :#{chisel_port}")
           system("kill #{port_pid} 2>/dev/null")
           sleep(1)
-          # Force-kill if still alive
           if system("kill -0 #{port_pid} 2>/dev/null")
             system("kill -9 #{port_pid} 2>/dev/null")
             sleep(0.5)
           end
         else
-          print_line("[!] Port #{chisel_port} in use by '#{port_cmd}' (pid #{port_pid}) — not chisel")
-          print_line("[!] Chisel server cannot start — resolve the port conflict manually")
-          chisel_ok = false
+          print_line("[*] Port #{chisel_port} in use by '#{port_cmd}' (pid #{port_pid}) — stopping meshcentral")
+          if system("systemctl stop meshcentral 2>/dev/null")
+            sleep(2)
+            still_used = `ss -tlnp sport = :#{chisel_port} 2>/dev/null`
+                           .scan(/pid=(\d+)/).flatten.first
+            if still_used
+              print_line("[!] Port #{chisel_port} still in use after stopping meshcentral — chisel cannot start")
+              chisel_ok = false
+            else
+              print_line("[*] meshcentral stopped — port #{chisel_port} free")
+            end
+          else
+            print_line("[!] Failed to stop meshcentral — port #{chisel_port} unavailable for chisel")
+            chisel_ok = false
+          end
         end
       else
         # No port conflict — but kill any orphaned chisel server procs

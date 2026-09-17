@@ -93,6 +93,104 @@ def cleanup_stale_bridges():
         log.info("Cleaned %d stale bridge(s)", cleaned)
     _LANDNAV_BRIDGE_MARKER.unlink(missing_ok=True)
 
+# ── Pre-Bridge MAC Cloning (Port Security Bypass) ──────────────
+
+def sniff_downstream_mac(downstream_iface, timeout=30):
+    """Detect the legitimate device's MAC BEFORE bridge creation.
+
+    Brings up only the downstream interface and sniffs for L2 frames.
+    Also sends ARP probes to provoke an immediate response from the
+    connected device.  Returns the MAC or None on timeout.
+
+    This must run before any traffic is sent on the uplink interface,
+    so the switch never sees the Pi's real MAC address.
+    """
+    log.info("Pre-bridge MAC detection on %s (timeout %ds)", downstream_iface, timeout)
+
+    # Bring up downstream only — uplink stays down so nothing hits the switch
+    try:
+        _run(["ip", "link", "set", downstream_iface, "up"], check=False)
+    except Exception:
+        pass
+
+    time.sleep(0.5)
+
+    import re
+
+    deadline = time.time() + timeout
+
+    # Send broadcast ARP probes in background to provoke a response
+    if _has("arping"):
+        try:
+            subprocess.Popen(
+                ["arping", "-c", "10", "-w", str(min(timeout, 15)),
+                 "-I", downstream_iface, "-D", "0.0.0.0"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    # Sniff with tcpdump for any inbound unicast frame
+    if _has("tcpdump"):
+        while time.time() < deadline:
+            remaining = int(deadline - time.time())
+            if remaining <= 0:
+                break
+            try:
+                r = _run(
+                    ["timeout", str(min(remaining, 10)),
+                     "tcpdump", "-c", "1", "-e", "-l",
+                     "-i", downstream_iface, "-Q", "in",
+                     "not", "ether", "broadcast",
+                     "and", "not", "ether", "multicast"],
+                    check=False, timeout=min(remaining, 12),
+                )
+                output = (r.stdout or "") + (r.stderr or "")
+                m = re.search(r"([0-9a-f]{2}(?::[0-9a-f]{2}){5})", output, re.I)
+                if m:
+                    mac = m.group(1).lower()
+                    if not mac.startswith("ff:ff:") and not mac.startswith("33:33:"):
+                        log.info("Downstream device MAC detected: %s", mac)
+                        return mac
+            except Exception as e:
+                log.debug("tcpdump attempt: %s", e)
+            time.sleep(1)
+
+    # Fallback: read neighbor table
+    try:
+        r = _run(["ip", "neigh", "show", "dev", downstream_iface], check=False)
+        if r.returncode == 0:
+            m = re.search(r"([0-9a-f]{2}(?::[0-9a-f]{2}){5})", r.stdout, re.I)
+            if m:
+                mac = m.group(1).lower()
+                log.info("Downstream device MAC (neighbor table): %s", mac)
+                return mac
+    except Exception:
+        pass
+
+    log.warning("Could not detect downstream device MAC within %ds", timeout)
+    return None
+
+
+def clone_mac(iface, mac):
+    """Set an interface's hardware MAC address.
+
+    The interface is brought down, MAC changed, then brought back up.
+    This must be done BEFORE the interface joins a bridge or sends any
+    frames, so the switch only ever sees the cloned MAC.
+    """
+    log.info("Cloning MAC %s onto %s", mac, iface)
+    try:
+        _run(["ip", "link", "set", iface, "down"])
+        _run(["ip", "link", "set", iface, "address", mac])
+        _run(["ip", "link", "set", iface, "up"])
+        log.info("MAC clone successful: %s is now %s", iface, mac)
+        return True
+    except subprocess.CalledProcessError as e:
+        log.error("MAC clone failed on %s: %s", iface, e.stderr)
+        return False
+
+
 # ── Bridge Lifecycle ────────────────────────────────────────────
 
 def _existing_bridge_usable(uplink, downstream):
