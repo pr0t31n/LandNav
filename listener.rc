@@ -89,6 +89,14 @@ if dns_cfg.fetch('enabled', true)
           print_line("[*] NS delegation for #{domain}: #{ns_out}")
         end
 
+        # Ensure UFW allows inbound DNS
+        if system("command -v ufw >/dev/null 2>&1")
+          unless `ufw status 2>/dev/null`.include?('53/udp')
+            system("ufw allow 53/udp >/dev/null 2>&1")
+            print_line("[*] UFW: opened 53/udp for iodined")
+          end
+        end
+
         # Start iodined — daemon mode (no -f), backgrounds itself
         tunnel_net = dns_cfg['tunnel_net'] || '10.53.53.1/24'
         if system("iodined -c -P '#{password}' #{tunnel_net} #{domain} 2>/dev/null")
@@ -167,6 +175,14 @@ if chisel_cfg.fetch('enabled', false)
         sleep(0.5) unless orphans.empty?
       end
 
+      # Ensure UFW allows inbound on chisel port
+      if system("command -v ufw >/dev/null 2>&1")
+        unless `ufw status 2>/dev/null`.include?("#{chisel_port}/tcp")
+          system("ufw allow #{chisel_port}/tcp >/dev/null 2>&1")
+          print_line("[*] UFW: opened #{chisel_port}/tcp for chisel")
+        end
+      end
+
       if chisel_ok
         chisel_cmd = "chisel server --reverse --port #{chisel_port}"
         chisel_cmd += " --auth '#{chisel_auth}'" unless chisel_auth.empty?
@@ -225,6 +241,17 @@ if chisel_cfg.fetch('enabled', false)
   end
 else
   print_line("[*] Chisel disabled in config")
+end
+
+# ── 5. UFW: ensure C2 listener ports are open ───────────────
+if system("command -v ufw >/dev/null 2>&1")
+  c2_ports = (cfg['c2'] || {})['ports'] || [4443, 8443]
+  c2_ports.each do |p|
+    unless `ufw status 2>/dev/null`.include?("#{p}/tcp")
+      system("ufw allow #{p}/tcp >/dev/null 2>&1")
+      print_line("[*] UFW: opened #{p}/tcp for C2 listener")
+    end
+  end
 end
 
 print_line("")
