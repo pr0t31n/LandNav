@@ -13,8 +13,9 @@ c2:
     - 4443
     - 8443
   # Device ID — offsets server-side listen ports so multiple appliances
-  # can connect simultaneously. "auto" derives a stable ID from the
-  # hostname. Set an explicit integer to override.
+  # can connect simultaneously. "auto" looks up the hostname in
+  # device_registry.json (sequential IDs assigned during provisioning).
+  # Set an explicit integer to override.
   device_id: auto
   # Retry interval (seconds) when all C2 methods fail.
   # LandNav will cycle through every method, wait this long, then retry.

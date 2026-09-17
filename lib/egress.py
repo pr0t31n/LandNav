@@ -15,6 +15,7 @@ configurable delay.
 """
 
 import base64
+import json
 import logging
 import os
 import re
@@ -56,21 +57,31 @@ _exec_kill_event = threading.Event()  # Signal for killing meterpreter exec thre
 
 
 def _resolve_device_id(config):
-    """Derive a stable per-appliance device_id for port offsetting.
+    """Look up this appliance's device_id from the device registry.
 
-    If config has an explicit device_id, use it. Otherwise auto-derive
-    from the hostname so every appliance gets a unique offset without
-    manual configuration.
+    The registry (device_registry.json) maps hostnames to sequential
+    integer IDs assigned during provisioning.  Ports offset by this ID
+    so the operator always knows the exact ports for each device.
     """
     explicit = config.get("c2", {}).get("device_id")
     if explicit is not None and explicit != "auto":
         return int(explicit)
-    import hashlib
+    registry_path = Path("/opt/pr0t31n/LandNav/device_registry.json")
     hostname = socket.gethostname()
-    h = int(hashlib.sha256(hostname.encode()).hexdigest(), 16)
-    device_id = h % 100
-    log.info("Auto-assigned device_id=%d from hostname '%s'", device_id, hostname)
-    return device_id
+    if registry_path.exists():
+        try:
+            registry = json.loads(registry_path.read_text())
+            if hostname in registry:
+                device_id = int(registry[hostname])
+                log.info("device_id=%d for '%s' from registry", device_id, hostname)
+                return device_id
+            log.warning("Hostname '%s' not in device registry — defaulting to device_id=0. "
+                        "Add to device_registry.json on the C2 server.", hostname)
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            log.warning("Failed to read device registry: %s — defaulting to device_id=0", exc)
+    else:
+        log.warning("No device_registry.json — defaulting to device_id=0")
+    return 0
 
 
 def force_shutdown():
