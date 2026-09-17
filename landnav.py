@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.11.2"
+VERSION = "0.11.3"
 
 import argparse
 import datetime
@@ -794,13 +794,10 @@ def _ensure_config_current(cfg, config_path):
         log.warning("Could not read config.yaml.example: %s", e)
         return cfg
 
-    changed = False
-
     for section_key, example_section in example_cfg.items():
         if section_key not in cfg:
             cfg[section_key] = example_section
-            log.info("Config: added missing section: %s", section_key)
-            changed = True
+            log.info("Config: added missing section: %s (in memory only)", section_key)
             continue
 
         if isinstance(example_section, dict) and isinstance(cfg[section_key], dict):
@@ -808,27 +805,12 @@ def _ensure_config_current(cfg, config_path):
             for key, example_val in example_section.items():
                 if key not in live_section:
                     live_section[key] = example_val
-                    log.info("Config: %s.%s added (default: %s)",
+                    log.info("Config: %s.%s added (default: %s, in memory only)",
                              section_key, key, example_val)
-                    changed = True
-
-    if cfg.get("chisel", {}).get("server_port") == 443:
-        cfg["chisel"]["server_port"] = 8443
-        log.info("Config: migrated chisel.server_port 443 → 8443")
-        changed = True
 
     if cfg.get("chisel", {}).get("socks_port") == 1080:
         cfg["chisel"]["socks_port"] = 1081
-        log.info("Config: migrated chisel.socks_port 1080 → 1081")
-        changed = True
-
-    if changed:
-        try:
-            with open(config_path, "w") as f:
-                yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-            log.info("Config: updated %s", config_path)
-        except Exception as e:
-            log.warning("Config: could not write: %s (changes in memory only)", e)
+        log.info("Config: socks_port 1080 → 1081 (in memory only)")
 
     return cfg
 
