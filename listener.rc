@@ -163,7 +163,7 @@ if chisel_cfg.fetch('enabled', false)
       end
 
       if chisel_ok
-        chisel_cmd = "chisel server --reverse --port #{chisel_port}"
+        chisel_cmd = "chisel server --reverse --v --port #{chisel_port}"
         chisel_cmd += " --auth '#{chisel_auth}'" unless chisel_auth.empty?
 
         if chisel_tls
