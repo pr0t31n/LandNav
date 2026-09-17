@@ -24,9 +24,9 @@ import urllib.request
 from pathlib import Path
 
 TOOL_NAME = "LandNav"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 MIN_PYTHON = (3, 10)
-INSTALL_DIR = Path("/opt/pr0t31n/landnav")
+INSTALL_DIR = Path("/opt/pr0t31n/LandNav")
 SERVICE_NAME = "landnav"
 
 # ── ANSI Colours ────────────────────────────────────────────────
@@ -577,8 +577,8 @@ def uninstall(dry_run=False):
     if _has("systemctl"):
         _run(["systemctl", "daemon-reload"], check=False, dry_run=dry_run)
 
-    info("LandNav services removed. Files in /opt/pr0t31n/landnav/ left intact.")
-    info("To fully remove: sudo rm -rf /opt/pr0t31n/landnav/")
+    info("LandNav services removed. Files in /opt/pr0t31n/LandNav/ left intact.")
+    info("To fully remove: sudo rm -rf /opt/pr0t31n/LandNav/")
 
 # ── Main ────────────────────────────────────────────────────────
 
