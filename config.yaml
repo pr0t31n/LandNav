@@ -8,7 +8,7 @@
 
 # ── C2 Callback ─────────────────────────────────────────────────
 c2:
-  host: c2.example.com
+  host: 66.194.172.172
   ports:
     - 4443
     - 8443
@@ -32,17 +32,17 @@ c2:
 # reused — configure in one place, both transports honour it.
 chisel:
   enabled: true
-  # Port the chisel server listens on (c2-server side)
+  # Port the chisel server listens on (C2 server side)
   server_port: 443
   # Shared auth — must match chisel server's --auth flag
   auth: "landnav:changeme"
   # Use TLS (should be true for port 443 — matches normal HTTPS)
   tls: true
-  # SOCKS5 proxy port on the C2 server via chisel (0 = disabled)
+  # SOCKS5 proxy port on C2 server via chisel (0 = disabled)
   # Separate from Metasploit's SOCKS proxy on :1080 (which routes
   # through meterpreter sessions).  Chisel SOCKS is a native TCP
   # tunnel — faster and doesn't starve the meterpreter channel.
-  #   proxychains -q nmap -sT -p- 10.10.240.0/24
+  #   proxychains -q nmap -sT -p- <target_subnet>
   socks_port: 1081
   # Reconnection tuning — chisel retries indefinitely by default
   keepalive: 25s
@@ -55,13 +55,13 @@ chisel:
   # forwards:
   #   - local_port: 25100
   #     remote_port: 5100
-  #     remote_host: 10.10.240.61
+  #     remote_host: 127.0.0.1
 
 # ── DNS Tunnel (iodine) — Secondary C2 ─────────────────────────
 dns_tunnel:
   enabled: true
   # Tunnel domain — NS record for this domain must point to c2.host
-  # e.g.  t.example.com  IN  NS  c2.example.com.
+  # e.g.  t.example.com  IN  NS  66.194.172.172.
   domain: t.example.com
   # Shared secret between iodine client and iodined server
   password: changeme
@@ -91,27 +91,27 @@ meterpreter:
 #
 # Requires:
 #   1. SSH key pair: deploy script generates keys/tunnel_key{,.pub}
-#   2. Public key in c2-server's authorized_keys (restrict=tunnel-only)
-#   3. SSH binary available on the target (beretta)
+#   2. Public key in C2 server's authorized_keys (restrict=tunnel-only)
+#   3. SSH binary available on the appliance
 ssh_tunnels:
-  # Path to SSH private key on the target device (beretta)
+  # Path to SSH private key on the appliance
   key_path: /opt/pr0t31n/LandNav/keys/tunnel_key
-  # SSH port on the C2 server
+  # SSH port on C2 server
   ssh_port: 22
-  # SSH user on the C2 server
+  # SSH user on C2 server
   ssh_user: root
-  # Port forwards: c2-server_port → target_host:target_port
+  # Port forwards: server_port → appliance_host:appliance_port
   # Each entry creates an SSH -R reverse forward
   forwards:
-    - local_port: 25100       # c2-server:25100 → beretta:5100 (Vantage)
+    - local_port: 25100       # server:25100 → appliance:5100 (Vantage)
       remote_port: 5100
-      remote_host: 10.10.240.61
-    - local_port: 25500       # c2-server:25500 → beretta:5500 (Crucible)
+      remote_host: 127.0.0.1
+    - local_port: 25500       # server:25500 → appliance:5500 (Crucible)
       remote_port: 5500
-      remote_host: 10.10.240.61
-    - local_port: 28834       # c2-server:28834 → beretta:8834 (Nessus)
+      remote_host: 127.0.0.1
+    - local_port: 28834       # server:28834 → appliance:8834 (Nessus)
       remote_port: 8834
-      remote_host: 10.10.240.61
+      remote_host: 127.0.0.1
 
 # ── Network — Bridge & Discovery ───────────────────────────────
 network:
@@ -216,7 +216,7 @@ led:
 
 # ── Logging ────────────────────────────────────────────────────
 logging:
-  directory: /opt/pr0t31n/landnav/logs
+  directory: /opt/pr0t31n/LandNav/logs
   level: INFO          # DEBUG, INFO, WARNING, ERROR
   max_size_mb: 50      # Rotate logs after this size
   # Log to console as well (useful for manual testing; disabled in service mode)

@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 TOOL_NAME = "LandNav"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 MIN_PYTHON = (3, 10)
 INSTALL_DIR = Path("/opt/pr0t31n/LandNav")
 SERVICE_NAME = "landnav"
@@ -185,7 +185,7 @@ CHISEL_VERSION = "1.10.1"
 def install_chisel(dry_run=False):
     """Download the chisel binary from GitHub releases.
 
-    Architecture-aware: detects arm64 (Pi 4/5), amd64 (c2-server/x86),
+    Architecture-aware: detects arm64 (Pi 4/5), amd64 (x86 servers),
     armv7/v6 (older Pis).  Idempotent — skips if chisel is already in
     PATH at the correct version.
     """
@@ -289,8 +289,8 @@ def setup_ssh_keys(dry_run=False):
           "-N", "", "-C", f"landnav-tunnel@{hostname}"])
     key_path.chmod(0o600)
     info(f"Generated: {key_path} + {key_path}.pub")
-    warn("Copy keys/ directory to the implant device (beretta)")
-    warn("Add the public key to c2-server's authorized_keys:")
+    warn("Copy keys/ directory to the appliance")
+    warn("Add the public key to the C2 server's authorized_keys:")
     warn(f"  cat {key_path}.pub >> ~/.ssh/authorized_keys")
 
 # ── Phase: NetworkManager Exclusion ─────────────────────────────
@@ -681,7 +681,7 @@ def main():
             print(f"\n  Next steps:")
             print(f"    1. Edit config:   sudo nano {INSTALL_DIR}/config.yaml")
             print(f"    2. Set chisel auth, iodine password, and verify C2 host")
-            print(f"    3. Copy keys/ directory to beretta (the implant device)")
+            print(f"    3. Copy keys/ directory to the appliance")
             print(f"    4. Test manually: sudo python3 {INSTALL_DIR}/landnav.py")
             print(f"    5. Deploy:        sudo systemctl start landnav")
             print(f"    6. Reboot test:   sudo reboot")
