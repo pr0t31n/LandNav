@@ -11,7 +11,7 @@
 # Python meterpreter is single-threaded and heavy SOCKS browsing
 # (especially WebSocket/SocketIO apps) starves the command channel.
 
-# ── Pre-flight: auto_commands + iodined + key check ───────────
+# ── Pre-flight: iodined + key check ──────────────────────────
 <ruby>
 require 'yaml'
 require 'set'
@@ -24,28 +24,7 @@ if File.exist?(CONFIG_PATH)
   cfg = YAML.safe_load(File.read(CONFIG_PATH)) || {}
 end
 
-# ── 1. Config sync + portfwd stripping ───────────────────────
-# prep_handler.py now also merges missing config sections from
-# config.yaml.example and applies version migrations (e.g. chisel
-# port 443→8443).  Re-read config afterward so later sections
-# (chisel server, iodined) use the updated values.
-prep = "#{LANDNAV_DIR}/prep_handler.py"
-if File.exist?(prep)
-  ret = system("python3 #{prep} -c #{CONFIG_PATH} 2>/dev/null")
-  if ret
-    print_line("[*] auto_commands.txt prepared (SSH-tunnel portfwd stripped)")
-    # Re-read config — prep_handler.py may have migrated values
-    if File.exist?(CONFIG_PATH)
-      cfg = YAML.safe_load(File.read(CONFIG_PATH)) || {}
-    end
-  else
-    print_line("[!] prep_handler.py failed — using auto_commands.txt as-is")
-  end
-else
-  print_line("[*] prep_handler.py not found — using auto_commands.txt as-is")
-end
-
-# ── 2. SSH tunnel key verification ────────────────────────────
+# ── 1. SSH tunnel key verification ────────────────────────────
 tunnel_cfg = cfg['ssh_tunnels'] || {}
 key_path = tunnel_cfg['key_path'] || "#{LANDNAV_DIR}/keys/tunnel_key"
 if File.exist?(key_path)
@@ -67,7 +46,7 @@ else
   print_line("[!]   Then push keys/ to the implant device")
 end
 
-# ── 3. Start iodined (DNS tunnel server) ─────────────────────
+# ── 2. Start iodined (DNS tunnel server) ─────────────────────
 dns_cfg = cfg['dns_tunnel'] || {}
 if dns_cfg.fetch('enabled', true)
   domain = dns_cfg['domain']
@@ -122,7 +101,7 @@ else
   print_line("[*] DNS tunnel disabled in config")
 end
 
-# ── 4. Start Chisel server (HTTPS reverse tunnel) ────────────
+# ── 3. Start Chisel server (HTTPS reverse tunnel) ────────────
 chisel_cfg = cfg['chisel'] || {}
 if chisel_cfg.fetch('enabled', false)
   if system("command -v chisel >/dev/null 2>&1")
@@ -243,7 +222,7 @@ else
   print_line("[*] Chisel disabled in config")
 end
 
-# ── 5. UFW: ensure C2 listener ports are open ───────────────
+# ── 4. UFW: ensure C2 listener ports are open ───────────────
 if system("command -v ufw >/dev/null 2>&1")
   c2_ports = (cfg['c2'] || {})['ports'] || [4443, 8443]
   c2_ports.each do |p|
