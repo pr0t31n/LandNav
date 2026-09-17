@@ -1,0 +1,7 @@
+[Unit]
+Description=LandNav Watchdog Check
+After=landnav.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/pr0t31n/LandNav/landnav-watchdog.py

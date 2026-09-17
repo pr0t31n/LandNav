@@ -60,6 +60,39 @@ def _disable_bridge_nf_call():
     ):
         _run(["sysctl", "-w", f"{param}=0"], check=False)
 
+# ── Startup Cleanup ────────────────────────────────────────────
+
+def cleanup_stale_bridges():
+    """Remove non-system-managed bridges left by a prior LandNav run.
+
+    Scans br1-br255 for bridges that are not system-managed, releases
+    their member interfaces, and deletes them.  This frees interfaces
+    like eth1 that would otherwise be invisible to detect_interfaces()
+    because their brport/ sysfs entry still exists.
+
+    Called once at startup before interface detection.
+    """
+    cleaned = 0
+    for i in range(1, 256):
+        name = f"br{i}"
+        if not netconfig.interface_exists(name):
+            continue
+        if netconfig.is_system_managed_bridge(name):
+            continue
+        members = netconfig.get_bridge_ports(name)
+        log.info("Cleaning stale bridge %s (members: %s)", name, members)
+        try:
+            for member in members:
+                _run(["ip", "link", "set", member, "nomaster"], check=False)
+            _run(["ip", "link", "set", name, "down"], check=False)
+            _run(["ip", "link", "del", name], check=False)
+            cleaned += 1
+        except Exception as e:
+            log.warning("Failed to clean bridge %s: %s", name, e)
+    if cleaned:
+        log.info("Cleaned %d stale bridge(s)", cleaned)
+    _LANDNAV_BRIDGE_MARKER.unlink(missing_ok=True)
+
 # ── Bridge Lifecycle ────────────────────────────────────────────
 
 def _existing_bridge_usable(uplink, downstream):
