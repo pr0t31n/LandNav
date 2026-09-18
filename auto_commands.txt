@@ -1,1 +1,0 @@
-run post/multi/manage/autoroute SUBNET=0.0.0.0 NETMASK=0.0.0.0
