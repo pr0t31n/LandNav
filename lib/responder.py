@@ -35,6 +35,9 @@ RESPONDER_PATHS = [
     "/usr/local/bin/responder",
 ]
 
+MAX_RESTARTS = 5
+RESTART_BACKOFF_BASE = 10
+
 
 class ResponderAnalyzer:
     """Runs Responder in analyze-only mode as a background process."""
@@ -46,6 +49,7 @@ class ResponderAnalyzer:
         self._process = None
         self._monitor_thread = None
         self._stop = threading.Event()
+        self._restart_count = 0
 
         self.recon_dir.mkdir(parents=True, exist_ok=True)
 
@@ -64,38 +68,15 @@ class ResponderAnalyzer:
         responder_log_dir = self.recon_dir / "responder"
         responder_log_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build command
-        cmd = self._build_command()
-        log.info("  Command: %s", " ".join(cmd))
-
-        try:
-            # Responder writes its own logs; we also capture stdout/stderr
-            stdout_log = open(responder_log_dir / "responder_stdout.log", "a")
-            stderr_log = open(responder_log_dir / "responder_stderr.log", "a")
-
-            env = os.environ.copy()
-
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=stdout_log,
-                stderr=stderr_log,
-                env=env,
-                cwd=str(Path(self.responder_path).parent),
-            )
-
-            log.info("Responder analyzer started (PID %d)", self._process.pid)
-
-            # Start monitor thread
-            self._monitor_thread = threading.Thread(
-                target=self._monitor_loop, daemon=True, name="responder-monitor",
-            )
-            self._monitor_thread.start()
-
-            return True
-
-        except Exception as e:
-            log.error("Failed to start Responder: %s", e)
+        if not self._start_process(responder_log_dir):
             return False
+
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, daemon=True, name="responder-monitor",
+        )
+        self._monitor_thread.start()
+
+        return True
 
     def stop(self):
         """Stop the Responder process."""
@@ -119,6 +100,34 @@ class ResponderAnalyzer:
 
     def is_running(self):
         return self._process is not None and self._process.poll() is None
+
+    # ── Process Lifecycle ──────────────────────────────────────
+
+    def _start_process(self, log_dir):
+        """Launch the Responder subprocess. Returns True on success."""
+        cmd = self._build_command()
+        log.info("  Command: %s", " ".join(cmd))
+
+        try:
+            stdout_log = open(log_dir / "responder_stdout.log", "a")
+            stderr_log = open(log_dir / "responder_stderr.log", "a")
+
+            env = os.environ.copy()
+
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=stdout_log,
+                stderr=stderr_log,
+                env=env,
+                cwd=str(Path(self.responder_path).parent),
+            )
+
+            log.info("Responder analyzer started (PID %d)", self._process.pid)
+            return True
+
+        except Exception as e:
+            log.error("Failed to start Responder: %s", e)
+            return False
 
     # ── Command Builder ─────────────────────────────────────────
 
@@ -151,10 +160,23 @@ class ResponderAnalyzer:
 
             if self._process and self._process.poll() is not None:
                 exit_code = self._process.returncode
-                log.warning("Responder exited with code %d — restarting", exit_code)
-                time.sleep(5)
-                if not self._stop.is_set():
-                    self.start()
+                self._restart_count += 1
+
+                if self._restart_count > MAX_RESTARTS:
+                    log.error("Responder exceeded %d restarts — giving up",
+                              MAX_RESTARTS)
+                    break
+
+                delay = min(RESTART_BACKOFF_BASE * self._restart_count, 120)
+                log.warning("Responder exited with code %d — restart %d/%d "
+                            "in %ds", exit_code, self._restart_count,
+                            MAX_RESTARTS, delay)
+                self._stop.wait(delay)
+                if self._stop.is_set():
+                    break
+
+                log_dir = self.recon_dir / "responder"
+                self._start_process(log_dir)
 
     # ── Log Consolidation ───────────────────────────────────────
 
