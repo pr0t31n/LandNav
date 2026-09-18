@@ -81,6 +81,22 @@ dns_tunnel:
   # Lazy mode (fewer queries when idle, saves bandwidth)
   lazy_mode: true
 
+# ── Traffic Tunnel — Outbound Stealth ────────────────────────
+# Routes the appliance's internet-bound traffic (DNS, HTTP, tool
+# callbacks) through the chisel tunnel so it exits via c2-server
+# instead of the client's gateway.  Hides outbound noise from
+# the target network's IDS/firewall.
+#
+# Uses the Mole-Client transparent proxy (iptables REDIRECT).
+# LAN traffic (RFC-1918) is always bypassed — local scanning
+# works normally.  Only internet-destined traffic is funnelled.
+#
+# Requires Mole-Client installed at /opt/pr0t31n/Mole-Client/.
+traffic_tunnel:
+  enabled: true
+  # Local SOCKS5 port for the chisel forward proxy (Pi-side)
+  local_socks_port: 1090
+
 # ── Python Meterpreter — Fallback C2 ─────────────────────────
 # Meterpreter reverse TCP has a recognisable stager signature.
 # To reduce detection risk, it only attempts after chisel AND

