@@ -27,7 +27,7 @@ TOOL_NAME = "LandNav"
 VERSION = "0.6.1"
 MIN_PYTHON = (3, 10)
 INSTALL_DIR = Path("/opt/pr0t31n/LandNav")
-SERVICE_NAME = "landnav"
+SERVICE_NAME = "pr0t31n-landnav"
 
 # ── ANSI Colours ────────────────────────────────────────────────
 
@@ -349,15 +349,15 @@ def install_service(dry_run=False):
         return
 
     units = [
-        ("landnav.service",            True),
-        ("landnav-watchdog.service",   False),
-        ("landnav-watchdog.timer",     False),
+        ("pr0t31n-landnav.service",            True),
+        ("pr0t31n-landnav-watchdog.service",   False),
+        ("pr0t31n-landnav-watchdog.timer",     False),
     ]
 
     if dry_run:
         for name, _ in units:
             step(f"Would install /etc/systemd/system/{name}")
-        step("Would enable and start landnav.service + landnav-watchdog.timer")
+        step("Would enable and start pr0t31n-landnav.service + pr0t31n-landnav-watchdog.timer")
         return
 
     installed = []
@@ -378,11 +378,11 @@ def install_service(dry_run=False):
 
     _run(["systemctl", "daemon-reload"])
     _run(["systemctl", "enable", "--now", SERVICE_NAME])
-    _run(["systemctl", "enable", "--now", "landnav-watchdog.timer"])
-    info("landnav.service enabled and started")
-    info("landnav-watchdog.timer enabled and started (checks every 2 minutes)")
-    info("To check status: sudo systemctl status landnav")
-    info("To view logs: sudo journalctl -u landnav -f")
+    _run(["systemctl", "enable", "--now", "pr0t31n-landnav-watchdog.timer"])
+    info("pr0t31n-landnav.service enabled and started")
+    info("pr0t31n-landnav-watchdog.timer enabled and started (checks every 2 minutes)")
+    info("To check status: sudo systemctl status pr0t31n-landnav")
+    info("To view logs: sudo journalctl -u pr0t31n-landnav -f")
 
 # ── Phase: Config File ──────────────────────────────────────────
 
@@ -461,7 +461,7 @@ def verify_install():
         ("tunnel key",  (INSTALL_DIR / "keys" / "tunnel_key").exists()),
         ("config.yaml", (INSTALL_DIR / "config.yaml").exists()),
         ("systemd svc", Path(f"/etc/systemd/system/{SERVICE_NAME}.service").exists()),
-        ("watchdog timer", Path("/etc/systemd/system/landnav-watchdog.timer").exists()),
+        ("watchdog timer", Path("/etc/systemd/system/pr0t31n-landnav-watchdog.timer").exists()),
     ]
 
     all_ok = True
@@ -545,14 +545,14 @@ def uninstall(dry_run=False):
 
     unit_files = [
         Path(f"/etc/systemd/system/{SERVICE_NAME}.service"),
-        Path("/etc/systemd/system/landnav-watchdog.service"),
-        Path("/etc/systemd/system/landnav-watchdog.timer"),
+        Path("/etc/systemd/system/pr0t31n-landnav-watchdog.service"),
+        Path("/etc/systemd/system/pr0t31n-landnav-watchdog.timer"),
     ]
     nm_conf = Path("/etc/NetworkManager/conf.d/landnav-unmanage.conf")
 
     if _has("systemctl"):
-        _run(["systemctl", "stop", "landnav-watchdog.timer"], check=False, dry_run=dry_run)
-        _run(["systemctl", "disable", "landnav-watchdog.timer"], check=False, dry_run=dry_run)
+        _run(["systemctl", "stop", "pr0t31n-landnav-watchdog.timer"], check=False, dry_run=dry_run)
+        _run(["systemctl", "disable", "pr0t31n-landnav-watchdog.timer"], check=False, dry_run=dry_run)
         _run(["systemctl", "stop", SERVICE_NAME], check=False, dry_run=dry_run)
         _run(["systemctl", "disable", SERVICE_NAME], check=False, dry_run=dry_run)
 

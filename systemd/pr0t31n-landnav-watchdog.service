@@ -1,6 +1,6 @@
 [Unit]
-Description=LandNav Watchdog Check
-After=landnav.service
+Description=pr0t31n LandNav Watchdog Check
+After=pr0t31n-landnav.service
 
 [Service]
 Type=oneshot

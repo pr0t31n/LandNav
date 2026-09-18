@@ -1,5 +1,5 @@
 [Unit]
-Description=LandNav Network Bootstrapper
+Description=pr0t31n LandNav Network Bootstrapper
 After=network-online.target
 Wants=network-online.target
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=LandNav Watchdog Timer
+Description=pr0t31n LandNav Watchdog Timer
 
 [Timer]
 OnBootSec=120
