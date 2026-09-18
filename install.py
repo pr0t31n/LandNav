@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 TOOL_NAME = "LandNav"
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 MIN_PYTHON = (3, 10)
 INSTALL_DIR = Path("/opt/pr0t31n/LandNav")
 SERVICE_NAME = "pr0t31n-landnav"
@@ -603,32 +603,10 @@ def main():
                         help="Skip chisel binary download")
     parser.add_argument("--skip-git", action="store_true",
                         help="(no-op) LandNav has no git tool dependencies")
-    parser.add_argument("--mode", choices=["device", "server"],
-                        help="Install mode: 'device' = full install (testing "
-                             "device / Raspberry Pi), 'server' = server-side "
-                             "RC scripts only (no systemd, no NM config)")
     args = parser.parse_args()
 
-    mode = args.mode
-    if not mode:
-        print(f"\n{_C['B']}  LandNav Install Mode{_C['R']}")
-        print(f"    1) Testing Device — full install (systemd service, watchdog,")
-        print(f"       NM config, bridge tools, chisel)")
-        print(f"    2) Server — server-side RC scripts only (no systemd service,")
-        print(f"       no networking changes)")
-        try:
-            choice = input(f"\n  Select mode [1/2]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            error("Aborted.")
-            sys.exit(1)
-        if choice == "2":
-            mode = "server"
-        else:
-            mode = "device"
-
     print(f"\n{_C['B']}{'═' * 60}")
-    label = "Dry Run" if args.check else f"Installation ({mode})"
+    label = "Dry Run" if args.check else "Installation"
     print(f"  {TOOL_NAME} v{VERSION} — {label}")
     print(f"{'═' * 60}{_C['R']}")
 
@@ -645,50 +623,37 @@ def main():
     info(f"Platform: {os_name} ({platform.machine()})")
     info(f"Python: {sys.version.split()[0]}")
     info(f"Networking: {net_backend}")
-    info(f"Mode: {mode}")
-
     if not args.skip_apt:
         install_system_deps(os_name, dry_run=args.check)
 
     if not args.skip_pip:
         install_pip_deps(dry_run=args.check)
 
-    if mode == "device":
-        if not args.skip_go:
-            install_chisel(dry_run=args.check)
-        configure_nm_exclusion(os_name, net_backend, dry_run=args.check)
-    else:
-        info("Server mode — skipping chisel, NM config")
+    if not args.skip_go:
+        install_chisel(dry_run=args.check)
+    configure_nm_exclusion(os_name, net_backend, dry_run=args.check)
 
     setup_directories(dry_run=args.check)
     setup_ssh_keys(dry_run=args.check)
     setup_config(dry_run=args.check)
 
-    if mode == "device":
-        install_service(dry_run=args.check)
-    else:
-        info("Server mode — skipping systemd service + watchdog install")
+    install_service(dry_run=args.check)
 
     if not args.check:
         all_ok = verify_install()
         print()
         if all_ok:
-            info(f"{_C['B']}{TOOL_NAME} installed successfully ({mode} mode).{_C['R']}")
+            info(f"{_C['B']}{TOOL_NAME} installed successfully.{_C['R']}")
         else:
             warn(f"{TOOL_NAME} installed with warnings — check above.")
 
-        if mode == "device":
-            print(f"\n  Next steps:")
-            print(f"    1. Edit config:   sudo nano {INSTALL_DIR}/config.yaml")
-            print(f"    2. Set chisel auth, iodine password, and verify C2 host")
-            print(f"    3. Copy keys/ directory to the appliance")
-            print(f"    4. Test manually: sudo python3 {INSTALL_DIR}/landnav.py")
-            print(f"    5. Deploy:        sudo systemctl start landnav")
-            print(f"    6. Reboot test:   sudo reboot")
-        else:
-            print(f"\n  Server mode — no systemd service installed.")
-            print(f"  The server-side RC listener scripts are available in:")
-            print(f"    {INSTALL_DIR}/")
+        print(f"\n  Next steps:")
+        print(f"    1. Edit config:   sudo nano {INSTALL_DIR}/config.yaml")
+        print(f"    2. Set chisel auth, iodine password, and verify C2 host")
+        print(f"    3. Copy keys/ directory to the appliance")
+        print(f"    4. Test manually: sudo python3 {INSTALL_DIR}/landnav.py")
+        print(f"    5. Deploy:        sudo systemctl start {SERVICE_NAME}")
+        print(f"    6. Reboot test:   sudo reboot")
         print()
 
 if __name__ == "__main__":
