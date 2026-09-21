@@ -20,7 +20,7 @@ Usage:
     python3 landnav.py --status         # Print current state and exit
 """
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 
 import argparse
 import datetime
@@ -208,6 +208,10 @@ def phase_detect_interfaces(cfg):
       2. Check for USB-ethernet adapter → LandNav bridge mode
       3. Single ethernet only → standalone mode
 
+    The uplink interface is NOT brought up here — in bridge mode the
+    uplink stays down until after MAC cloning so the switch never sees
+    the Pi's real MAC address.
+
     Returns:
         dict: mode ("bridge"|"bridge-reuse"|"standalone"),
               uplink, downstream, existing_bridge (bool)
@@ -256,11 +260,9 @@ def phase_detect_interfaces(cfg):
         log.error("No onboard ethernet interface found")
         return None
 
-    netconfig.set_interface_up(uplink)
-    time.sleep(2)
-
-    if not netconfig.interface_has_carrier(uplink):
-        log.warning("%s has no carrier — cable may not be connected", uplink)
+    # Uplink is NOT brought up here in bridge mode — it stays down
+    # until after MAC cloning (in _setup_bridge_mode) so the switch
+    # never sees the Pi's real MAC address.
 
     bridge_cfg = cfg.get("network", {}).get("bridge", {})
 
@@ -269,6 +271,12 @@ def phase_detect_interfaces(cfg):
         netconfig.set_interface_up(usb_eth)
         return {"mode": "bridge", "uplink": uplink, "downstream": usb_eth,
                 "existing_bridge": False}
+
+    # Standalone mode — safe to bring uplink up now (no port security concern)
+    netconfig.set_interface_up(uplink)
+    time.sleep(2)
+    if not netconfig.interface_has_carrier(uplink):
+        log.warning("%s has no carrier — cable may not be connected", uplink)
 
     log.info("No USB-ethernet — STANDALONE mode on %s", uplink)
     return {"mode": "standalone", "uplink": uplink, "downstream": None,
@@ -357,13 +365,25 @@ def _setup_bridge_reuse_mode(net_cfg, iface_info):
 
 
 def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
-    """Bridge mode network setup."""
+    """Bridge mode network setup with port security bypass cascade.
+
+    Sequence:
+      1. Sniff downstream MAC (before any uplink traffic)
+      2. Clone MAC onto uplink
+      3. Create macvlan on uplink (before bridge creation)
+      4. Suppress IPv6 on all interfaces
+      5. Create bridge
+      6. Discover network via passive sniffing
+      7. Cascade for Pi connectivity:
+         a. macvlan + DHCP  (creates DHCP snooping table entry)
+         b. macvlan + static (find_unused_ip on macvlan)
+         c. IP piggyback    (share legit device's IP, ARP-silent)
+         d. Legacy static   (direct IP on br0 — last resort)
+    """
     bridge_cfg = net_cfg.get("bridge", {})
+    port_sec = bridge_cfg.get("port_security_bypass", "auto")
 
     # ── Pre-bridge MAC clone (port security bypass) ──────────────
-    # Detect the legitimate device's MAC BEFORE creating the bridge
-    # or sending any traffic upstream.  Clone it onto the uplink
-    # interface so the switch only ever sees one MAC on the port.
     legit_mac = None
     if bridge_cfg.get("mac_transparency", True):
         legit_mac = bridge.sniff_downstream_mac(
@@ -374,10 +394,29 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
             log.warning("Could not detect downstream MAC — port security "
                         "may block connectivity")
 
+    # ── Create macvlan for Pi's isolated L3 stack ────────────────
+    # Must happen BEFORE uplink joins the bridge — macvlan on a
+    # bridged interface cannot communicate with hosts behind the
+    # bridge's forwarding path.
+    macvlan_ok = False
+    if legit_mac and port_sec != "off":
+        bridge.suppress_ipv6(uplink)
+        bridge.suppress_ipv6(downstream)
+        macvlan_ok = bridge.create_macvlan(uplink, legit_mac)
+        if macvlan_ok:
+            log.info("macvlan created on %s before bridge — isolated L3 stack ready",
+                     uplink)
+        else:
+            log.warning("macvlan creation failed — will fall back to legacy IP on bridge")
+
+    # ── Create bridge ────────────────────────────────────────────
     led.set_state(led.BRIDGE_UP)
     if not bridge.create_bridge(uplink, downstream, stp=bridge_cfg.get("stp", False)):
         log.error("Bridge creation failed — falling back to standalone")
+        bridge.destroy_macvlan()
         return _setup_standalone_mode(uplink, net_cfg, disc_cfg)
+
+    bridge.suppress_ipv6(bridge.BRIDGE_NAME)
 
     log.info("Bridge active — sniffing for legitimate device traffic")
     led.set_state(led.DISCOVERY)
@@ -386,6 +425,7 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
         legit_mac = bridge.get_downstream_mac(downstream,
                                                timeout=disc_cfg.get("dhcp_timeout", 30))
 
+    # ── Network discovery (passive → active → brute force) ────
     net_config = discovery.sniff_dhcp(
         bridge.BRIDGE_NAME,
         timeout=disc_cfg.get("dhcp_timeout", 30),
@@ -429,6 +469,7 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
 
     if not net_config.gateway:
         log.error("All network discovery methods failed")
+        bridge.destroy_macvlan()
         return None
 
     if legit_mac:
@@ -440,25 +481,97 @@ def _setup_bridge_mode(uplink, downstream, net_cfg, disc_cfg):
     if not net_config.cidr:
         net_config.cidr = 24
 
-    pi_ip = discovery.find_unused_ip(
-        net_config.gateway,
-        cidr=net_config.cidr,
-        preferred_octets=net_cfg.get("fallback_octets",
-                                     [net_cfg.get("preferred_ip_octet", 236)]),
-        iface=bridge.BRIDGE_NAME,
-    )
-
-    if not pi_ip:
-        log.error("No unused IP available")
-        return None
-
-    net_config.ip = pi_ip
-
     dns_servers = net_config.dns_servers or net_cfg.get("fallback_dns", ["8.8.8.8"])
-    bridge.configure_bridge_ip(
-        pi_ip, net_config.cidr, net_config.gateway,
-        dns_servers=dns_servers, domain=net_config.domain,
-    )
+
+    # ── Port security bypass cascade ─────────────────────────────
+    # Try progressively less stealthy methods for the Pi's own
+    # network connectivity.  Each method that succeeds gives the Pi
+    # an IP that passes DHCP snooping + Dynamic ARP Inspection.
+
+    pi_connected = False
+
+    # ── Tier 1: macvlan + DHCP ───────────────────────────────────
+    # Best option — the Pi gets its own DHCP lease with a unique
+    # client-id, creating a valid entry in the DHCP snooping table.
+    # DAI will pass the Pi's ARP because the IP-MAC binding exists.
+    if macvlan_ok and port_sec != "off":
+        log.info("Port security bypass: trying macvlan + DHCP")
+        dhcp_info = bridge.dhcp_macvlan(timeout=disc_cfg.get("dhcp_timeout", 30))
+        if dhcp_info and dhcp_info.get("ip"):
+            net_config.ip = dhcp_info["ip"]
+            net_config.discovery_method = "macvlan-dhcp"
+            pi_connected = True
+            log.info("macvlan DHCP succeeded: %s/%s",
+                     dhcp_info["ip"], dhcp_info.get("cidr", net_config.cidr))
+
+    # ── Tier 2: macvlan + static IP ──────────────────────────────
+    # DHCP unavailable or blocked — assign a static IP on the
+    # macvlan.  Won't have a snooping table entry but the macvlan's
+    # MAC matches the legitimate device so MAC-based port security
+    # still passes.
+    if not pi_connected and macvlan_ok and port_sec != "off":
+        log.info("Port security bypass: trying macvlan + static IP")
+        pi_ip = discovery.find_unused_ip(
+            net_config.gateway,
+            cidr=net_config.cidr,
+            preferred_octets=net_cfg.get("fallback_octets",
+                                         [net_cfg.get("preferred_ip_octet", 236)]),
+            iface=bridge.BRIDGE_NAME,
+        )
+        if pi_ip:
+            bridge.configure_macvlan_ip(
+                pi_ip, net_config.cidr, net_config.gateway,
+                dns_servers=dns_servers, domain=net_config.domain,
+            )
+            net_config.ip = pi_ip
+            net_config.discovery_method = "macvlan-static"
+            pi_connected = True
+            log.info("macvlan static IP assigned: %s/%d", pi_ip, net_config.cidr)
+
+    # ── Tier 3: IP piggyback (share legit device's IP) ───────────
+    # macvlan failed or unavailable — share the legitimate device's
+    # sniffed IP on the bridge itself with ARP suppression.  The
+    # Pi never issues ARP, so DAI never inspects it.  Works because
+    # ebtables SNAT rewrites the source MAC to match the legit
+    # device, making one consistent identity on the wire.
+    if not pi_connected and net_config.client_ip:
+        log.info("Port security bypass: trying IP piggyback with %s",
+                 net_config.client_ip)
+        if bridge.setup_ip_piggyback(
+            net_config.client_ip, net_config.gateway,
+            dns_servers=dns_servers, domain=net_config.domain,
+        ):
+            net_config.ip = net_config.client_ip
+            net_config.discovery_method = "piggyback"
+            pi_connected = True
+            log.info("IP piggyback active: sharing %s", net_config.client_ip)
+
+    # ── Tier 4: Legacy static IP on br0 (last resort) ────────────
+    # No macvlan, no client_ip to piggyback — assign a static IP
+    # directly on the bridge.  This is the pre-0.16.0 behavior
+    # and will fail under strict DHCP snooping + DAI but works
+    # on networks with MAC-only port security.
+    if not pi_connected:
+        log.info("Port security bypass: falling back to legacy static on br0")
+        pi_ip = discovery.find_unused_ip(
+            net_config.gateway,
+            cidr=net_config.cidr,
+            preferred_octets=net_cfg.get("fallback_octets",
+                                         [net_cfg.get("preferred_ip_octet", 236)]),
+            iface=bridge.BRIDGE_NAME,
+        )
+        if pi_ip:
+            net_config.ip = pi_ip
+            net_config.discovery_method = "static"
+            bridge.configure_bridge_ip(
+                pi_ip, net_config.cidr, net_config.gateway,
+                dns_servers=dns_servers, domain=net_config.domain,
+            )
+            pi_connected = True
+        else:
+            log.error("No unused IP available for legacy static fallback")
+            bridge.destroy_macvlan()
+            return None
 
     return net_config
 

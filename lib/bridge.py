@@ -12,10 +12,17 @@ until it finds an available name.
 
 ebtables SNAT rewrites the Pi's outgoing MAC to match the legitimate
 device, achieving full Layer-2 invisibility.
+
+Port security bypass (v0.16.0):
+  1. macvlan + DHCP — isolated L3 stack with DHCP snooping table entry
+  2. macvlan + static — isolated L3 stack with find_unused_ip()
+  3. IP piggyback — share the legitimate device's IP (ARP-silent)
+  4. Legacy static — direct IP on br0 (last resort)
 """
 
 import logging
 import os
+import re as _re
 import shutil
 import subprocess
 import time
@@ -26,6 +33,8 @@ from lib import netconfig
 log = logging.getLogger("landnav.bridge")
 
 BRIDGE_NAME = "br0"
+MACVLAN_NAME = "macvlan0"
+_DHCLIENT_CONF = Path("/tmp/landnav_dhclient.conf")
 
 # ── Helpers ─────────────────────────────────────────────────────
 
@@ -92,6 +101,9 @@ def cleanup_stale_bridges():
     if cleaned:
         log.info("Cleaned %d stale bridge(s)", cleaned)
     _LANDNAV_BRIDGE_MARKER.unlink(missing_ok=True)
+
+    # Clean stale macvlan from prior run
+    destroy_macvlan()
 
 # ── Pre-Bridge MAC Cloning (Port Security Bypass) ──────────────
 
@@ -357,6 +369,9 @@ def destroy_bridge():
     /etc/network/interfaces, NetworkManager, or netplan).  Only destroys
     bridges that LandNav created (indicated by the marker file).
     """
+    # Clean up macvlan first
+    destroy_macvlan()
+
     if not netconfig.interface_exists(BRIDGE_NAME):
         _LANDNAV_BRIDGE_MARKER.unlink(missing_ok=True)
         return
@@ -536,3 +551,154 @@ def configure_bridge_ip(ip, cidr, gateway, dns_servers=None, domain=None):
     netconfig.set_default_route(gateway, BRIDGE_NAME)
     if dns_servers:
         netconfig.set_dns(dns_servers, domain)
+
+# ── macvlan for Pi's Network Stack (Port Security Bypass) ──────
+
+def create_macvlan(parent_iface, legit_mac):
+    """Create a macvlan on the uplink for the Pi's isolated L3 stack.
+
+    The macvlan uses the legitimate device's MAC natively so port
+    security sees a single MAC on the wire.  Created on the physical
+    uplink BEFORE bridge creation — the macvlan persists independently
+    of the bridge's forwarding path.
+
+    Return traffic reaches the Pi via macvlan MAC match; bridge-
+    forwarded traffic reaches the legitimate device via FDB lookup.
+    """
+    log.info("Creating macvlan %s on %s (MAC %s)", MACVLAN_NAME, parent_iface, legit_mac)
+    try:
+        _run(["ip", "link", "del", MACVLAN_NAME], check=False)
+
+        _run(["ip", "link", "add", MACVLAN_NAME, "link", parent_iface,
+              "type", "macvlan", "mode", "bridge"])
+        _run(["ip", "link", "set", MACVLAN_NAME, "address", legit_mac])
+        suppress_ipv6(MACVLAN_NAME)
+        _run(["ip", "link", "set", MACVLAN_NAME, "up"])
+
+        log.info("macvlan %s created on %s", MACVLAN_NAME, parent_iface)
+        return True
+    except subprocess.CalledProcessError as e:
+        log.error("macvlan creation failed: %s", e.stderr)
+        return False
+
+
+def dhcp_macvlan(iface=None, timeout=30):
+    """Obtain a DHCP lease on the macvlan with a unique client-id.
+
+    A distinct client-id makes the DHCP server treat the Pi as a
+    separate client from the legitimate device, assigning a different
+    IP.  That new IP enters the DHCP snooping table so Dynamic ARP
+    Inspection validates the Pi's ARP requests.
+
+    Returns dict with ip/cidr on success, None on failure.
+    """
+    iface = iface or MACVLAN_NAME
+
+    import random
+    import string
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    client_id = f"DESKTOP-{suffix}"
+
+    conf = (
+        f'interface "{iface}" {{\n'
+        f'    send dhcp-client-identifier "{client_id}";\n'
+        f'    send host-name "{client_id}";\n'
+        f'}}\n'
+    )
+    _DHCLIENT_CONF.write_text(conf)
+
+    log.info("DHCP on %s (client-id: %s, timeout %ds)", iface, client_id, timeout)
+    _run(["dhclient", "-r", iface], check=False, timeout=10)
+
+    try:
+        _run(["dhclient", "-1", "-v", "-cf", str(_DHCLIENT_CONF), iface],
+             check=False, timeout=timeout)
+        info = netconfig.get_interface_info(iface)
+        if info["ip"]:
+            log.info("DHCP on %s: IP=%s/%s", iface, info["ip"], info["cidr"])
+            return info
+        log.warning("dhclient exited without IP on %s", iface)
+        return None
+    except subprocess.TimeoutExpired:
+        log.warning("dhclient timed out on %s", iface)
+        _run(["dhclient", "-r", iface], check=False, timeout=5)
+        return None
+    finally:
+        _DHCLIENT_CONF.unlink(missing_ok=True)
+
+
+def configure_macvlan_ip(ip, cidr, gateway, dns_servers=None, domain=None):
+    """Assign a static IP to the macvlan for Pi's connectivity."""
+    log.info("Static IP on %s: %s/%d gw %s", MACVLAN_NAME, ip, cidr, gateway)
+    netconfig.set_ip(MACVLAN_NAME, ip, cidr)
+    netconfig.set_default_route(gateway, MACVLAN_NAME)
+    if dns_servers:
+        netconfig.set_dns(dns_servers, domain)
+
+
+def setup_ip_piggyback(legit_ip, gateway, dns_servers=None, domain=None):
+    """Share the legitimate device's IP on the bridge (fallback).
+
+    Assigns the legitimate device's IP to br0 with ARP suppression
+    so the Pi never broadcasts conflicting ARP announcements.  A
+    static ARP entry for the gateway lets the Pi reach the network
+    without issuing its own ARP requests.
+
+    All outbound frames already carry the legitimate device's MAC
+    (via ebtables SNAT), so port security + DHCP snooping + DAI
+    see one consistent identity on the wire.
+    """
+    log.info("IP piggyback: using legit IP %s on %s", legit_ip, BRIDGE_NAME)
+
+    suppress_ipv6(BRIDGE_NAME)
+
+    # Suppress ARP announcements — the legitimate device handles ARP
+    _run(["sysctl", "-w", f"net.ipv4.conf.{BRIDGE_NAME}.arp_announce=2"], check=False)
+    _run(["sysctl", "-w", f"net.ipv4.conf.{BRIDGE_NAME}.arp_notify=0"], check=False)
+    _run(["sysctl", "-w", f"net.ipv4.conf.{BRIDGE_NAME}.arp_ignore=8"], check=False)
+
+    # Learn gateway's MAC from neighbor table (populated by bridge sniffing)
+    gw_mac = None
+    try:
+        r = _run(["ip", "neigh", "show", gateway], check=False)
+        m = _re.search(r"([0-9a-f]{2}(?::[0-9a-f]{2}){5})", r.stdout, _re.I)
+        if m:
+            gw_mac = m.group(1)
+    except Exception:
+        pass
+
+    netconfig.flush_interface(BRIDGE_NAME)
+    _run(["ip", "addr", "add", f"{legit_ip}/32", "dev", BRIDGE_NAME,
+          "noprefixroute"], check=False)
+
+    if gw_mac:
+        _run(["ip", "neigh", "replace", gateway, "lladdr", gw_mac,
+              "nud", "permanent", "dev", BRIDGE_NAME], check=False)
+        log.info("Static ARP: %s -> %s", gateway, gw_mac)
+
+    _run(["ip", "route", "add", f"{gateway}/32", "dev", BRIDGE_NAME], check=False)
+    netconfig.set_default_route(gateway, BRIDGE_NAME)
+
+    if dns_servers:
+        netconfig.set_dns(dns_servers, domain)
+
+    log.info("IP piggyback active: %s on %s", legit_ip, BRIDGE_NAME)
+    return True
+
+
+def destroy_macvlan():
+    """Remove macvlan interface and release any DHCP lease."""
+    if not netconfig.interface_exists(MACVLAN_NAME):
+        return
+    try:
+        _run(["dhclient", "-r", MACVLAN_NAME], check=False, timeout=5)
+    except Exception:
+        pass
+    _run(["ip", "link", "del", MACVLAN_NAME], check=False)
+    _DHCLIENT_CONF.unlink(missing_ok=True)
+    log.info("macvlan %s destroyed", MACVLAN_NAME)
+
+
+def suppress_ipv6(iface):
+    """Disable IPv6 to prevent NDP leaking the Pi's real MAC via EUI-64."""
+    _run(["sysctl", "-w", f"net.ipv6.conf.{iface}.disable_ipv6=1"], check=False)

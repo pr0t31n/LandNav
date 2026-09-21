@@ -154,6 +154,11 @@ network:
     # Rewrite Pi's outgoing MAC to match the legitimate device.
     # Requires ebtables. Makes the Pi invisible on the switch port.
     mac_transparency: true
+    # Port security bypass strategy for the Pi's own network stack.
+    #   auto — try macvlan+DHCP → macvlan+static → IP piggyback → legacy
+    #   off  — skip macvlan/piggyback, use legacy static IP on br0
+    # "auto" is recommended for networks with DHCP snooping + DAI.
+    port_security_bypass: auto
 
   discovery:
     # Seconds to wait for DHCP lease / sniffed DHCP exchange
