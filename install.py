@@ -55,6 +55,26 @@ def _run(cmd, check=True, dry_run=False):
 def _has(binary):
     return shutil.which(binary) is not None
 
+
+def _pip_installed(pkg_spec):
+    import importlib.util
+    name = pkg_spec.split(">=")[0].split("==")[0].split("[")[0].split("<")[0].strip()
+    _IMPORT_MAP = {
+        "pyyaml": "yaml", "python3-scapy": "scapy",
+    }
+    mod = _IMPORT_MAP.get(name, name.replace("-", "_"))
+    return importlib.util.find_spec(mod) is not None
+
+
+def _brew_installed_set():
+    try:
+        r = subprocess.run(["brew", "list", "--formula", "-1"],
+                           capture_output=True, text=True, check=True)
+        return set(r.stdout.strip().splitlines())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return set()
+
+
 # ── OS Detection ────────────────────────────────────────────────
 
 def detect_os():
@@ -141,7 +161,11 @@ def install_system_deps(os_name, dry_run=False):
         if not _has("brew"):
             warn("Homebrew not found — install from https://brew.sh")
             return
+        installed = _brew_installed_set()
         for pkg in BREW_PACKAGES:
+            if pkg in installed:
+                info(f"✓ {pkg} already installed")
+                continue
             _run(["brew", "install", pkg], dry_run=dry_run, check=False)
         warn("macOS: bridge/ebtables/arping/responder not available — "
              "LandNav bridge mode and Responder require Linux")
@@ -163,8 +187,21 @@ def install_pip_deps(dry_run=False):
         warn("requirements.txt not found — skipping pip install")
         return
 
+    missing = []
+    for line in req_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if _pip_installed(line):
+            info(f"✓ {line} already installed")
+        else:
+            missing.append(line)
+    if not missing:
+        info("All Python packages already installed")
+        return
+
     _run([sys.executable, "-m", "pip", "install",
-          "--break-system-packages", "-r", str(req_file)],
+          "--break-system-packages"] + missing,
          dry_run=dry_run, check=False)
 
 # ── Phase: Chisel Binary ───────────────────────────────────────
