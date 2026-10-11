@@ -41,6 +41,7 @@ def _p(tag, colour, msg):
 
 def info(msg):    _p("+", _C["G"], msg)
 def warn(msg):    _p("!", _C["Y"], msg)
+def note(msg):    _p("i", _C["Y"], msg)
 def error(msg):   _p("-", _C["RD"], msg)
 def step(msg):    _p("*", _C["C"], msg)
 def phase(msg):   print(f"\n{_C['B']}{'═' * 60}\n  {msg}\n{'═' * 60}{_C['R']}")
@@ -154,12 +155,12 @@ def install_system_deps(os_name, dry_run=False):
             # Try installing from Kali repo or clone from GitHub
             info("Responder not in apt — checking /usr/share/responder/")
             if not Path("/usr/share/responder/Responder.py").exists():
-                warn("Responder not found — install manually from "
+                note("Responder not found — install manually from "
                      "https://github.com/lgandx/Responder or apt install responder")
 
     elif os_name == "macos":
         if not _has("brew"):
-            warn("Homebrew not found — install from https://brew.sh")
+            note("Homebrew not found — install from https://brew.sh")
             return
         installed = _brew_installed_set()
         for pkg in BREW_PACKAGES:
@@ -184,7 +185,7 @@ def install_pip_deps(dry_run=False):
         req_file = Path(__file__).resolve().parent / "requirements.txt"
 
     if not req_file.exists():
-        warn("requirements.txt not found — skipping pip install")
+        note("requirements.txt not found — skipping pip install")
         return
 
     missing = []
@@ -246,7 +247,7 @@ def install_chisel(dry_run=False):
     arch = _ARCH_MAP.get(machine)
     if not arch:
         warn(f"Unknown architecture '{machine}' — cannot download chisel")
-        warn("Install manually: go install github.com/jpillora/chisel@latest")
+        note("Install manually: go install github.com/jpillora/chisel@latest")
         warn("  Or download from https://github.com/jpillora/chisel/releases")
         return
 
@@ -293,7 +294,7 @@ def install_chisel(dry_run=False):
 
     except Exception as e:
         error(f"Failed to download chisel: {e}")
-        warn("Install manually: go install github.com/jpillora/chisel@latest")
+        note("Install manually: go install github.com/jpillora/chisel@latest")
         warn("  Or download from https://github.com/jpillora/chisel/releases")
         # Clean up partial download
         if tmp_path.exists():
