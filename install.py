@@ -57,6 +57,26 @@ def _has(binary):
     return shutil.which(binary) is not None
 
 
+
+def _dpkg_installed(pkg):
+    try:
+        r = subprocess.run(["dpkg", "-s", pkg],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _rpm_installed(pkg):
+    try:
+        return subprocess.run(
+            ["rpm", "-q", pkg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def _pip_installed(pkg_spec):
     import importlib.util
     name = pkg_spec.split(">=")[0].split("==")[0].split("[")[0].split("<")[0].strip()
@@ -147,8 +167,13 @@ def install_system_deps(os_name, dry_run=False):
             error("apt-get not found")
             return
         _run(["apt-get", "update", "-qq"], dry_run=dry_run, check=False)
-        _run(["apt-get", "install", "-y", "--no-install-recommends"] + APT_PACKAGES,
-             dry_run=dry_run, check=False)
+        _needed = [p for p in APT_PACKAGES if not _dpkg_installed(p)]
+        _skip = len(APT_PACKAGES) - len(_needed)
+        if _skip:
+            info(f"  {_skip} APT package(s) already installed")
+        if _needed:
+            _run(["apt-get", "install", "-y", "--no-install-recommends"] + _needed,
+                 dry_run=dry_run, check=False)
 
         # Responder may not be in apt on all distros — check if installed
         if not dry_run and not _has("responder"):

@@ -1053,6 +1053,18 @@ def main():
         sys.exit(0)
 
     _run_dir = create_run_dir()
+    try:
+        import sys as _sys
+        if "/opt/pr0t31n/shared" not in _sys.path:
+            _sys.path.insert(0, "/opt/pr0t31n/shared")
+        import pr0t31n_dep_snapshot as _ds
+        _ds.write_snapshot(
+            _run_dir, "landnav", VERSION,
+            binaries=["chisel"],
+            pip_packages=["scapy", "PyYAML", "netifaces"],
+        )
+    except Exception:
+        pass
 
     setup_logging(_run_dir, cfg.get("logging", {}))
     _start_time = datetime.datetime.now().isoformat()
