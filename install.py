@@ -116,6 +116,26 @@ def detect_os():
         pass
     return "linux"
 
+# ── Kali Detection (fine-grained) ─────────────────────────────
+
+def _read_os_release() -> dict:
+    d = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                line = line.strip()
+                if "=" not in line: continue
+                k, _, v = line.partition("=")
+                d[k.lower()] = v.strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return d
+
+_OS_RELEASE = _read_os_release()
+
+def is_kali() -> bool:
+    return "kali" in _OS_RELEASE.get("id", "").lower()
+
 # ── Networking Backend Detection ────────────────────────────────
 
 def detect_net_backend():
@@ -136,7 +156,7 @@ def detect_net_backend():
 
 # ── Phase: System Packages ──────────────────────────────────────
 
-# Required system packages
+# Required system packages (all distros)
 APT_PACKAGES = [
     "bridge-utils",     # brctl (bridge management)
     "ebtables",         # Layer 2 MAC rewriting
@@ -150,7 +170,11 @@ APT_PACKAGES = [
     "curl",             # HTTP testing
     "python3-pip",      # pip
     "python3-scapy",    # scapy (prefer system package on Pi)
-    "responder",        # LLMNR/NBT-NS/WPAD analyzer
+]
+
+# Kali-only packages (not in standard Debian/Ubuntu repos)
+APT_PACKAGES_KALI = [
+    "responder",        # LLMNR/NBT-NS/WPAD analyzer (Kali repo only)
 ]
 
 BREW_PACKAGES = [
@@ -159,7 +183,27 @@ BREW_PACKAGES = [
     "iodine",
 ]
 
+_apt_updated = False
+
+def apt_install_optional(packages):
+    global _apt_updated
+    if not _apt_updated:
+        info("Running apt-get update ...")
+        _run(["apt-get", "update", "-y"])
+        _apt_updated = True
+    for pkg in packages:
+        if _dpkg_installed(pkg):
+            info(f"  ✓ {pkg} already installed")
+            continue
+        r = subprocess.run(["apt-get", "install", "-y", pkg],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if r.returncode == 0:
+            info(f"  ✓ {pkg} installed")
+        else:
+            warn(f"  {pkg} not available — skipping (install manually if needed)")
+
 def install_system_deps(os_name, dry_run=False):
+    global _apt_updated
     phase("Phase 1: System Packages")
 
     if os_name in ("kali", "raspbian", "debian"):
@@ -167,6 +211,8 @@ def install_system_deps(os_name, dry_run=False):
             error("apt-get not found")
             return
         _run(["apt-get", "update", "-qq"], dry_run=dry_run, check=False)
+        if not dry_run:
+            _apt_updated = True
         _needed = [p for p in APT_PACKAGES if not _dpkg_installed(p)]
         _skip = len(APT_PACKAGES) - len(_needed)
         if _skip:
@@ -175,13 +221,13 @@ def install_system_deps(os_name, dry_run=False):
             _run(["apt-get", "install", "-y", "--no-install-recommends"] + _needed,
                  dry_run=dry_run, check=False)
 
-        # Responder may not be in apt on all distros — check if installed
-        if not dry_run and not _has("responder"):
-            # Try installing from Kali repo or clone from GitHub
-            info("Responder not in apt — checking /usr/share/responder/")
-            if not Path("/usr/share/responder/Responder.py").exists():
-                note("Responder not found — install manually from "
-                     "https://github.com/lgandx/Responder or apt install responder")
+        # Kali-only packages (responder etc.)
+        if not dry_run:
+            if is_kali():
+                apt_install_optional(APT_PACKAGES_KALI)
+            else:
+                warn("responder is only available in Kali repos.")
+                note("On other distros, install from: https://github.com/lgandx/Responder")
 
     elif os_name == "macos":
         if not _has("brew"):
