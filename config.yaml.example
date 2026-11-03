@@ -83,7 +83,7 @@ dns_tunnel:
 
 # ── Traffic Tunnel — Outbound Stealth ────────────────────────
 # Routes the appliance's internet-bound traffic (DNS, HTTP, tool
-# callbacks) through the chisel tunnel so it exits via c2-server
+# callbacks) through the chisel tunnel so it exits via the C2 server
 # instead of the client's gateway.  Hides outbound noise from
 # the target network's IDS/firewall.
 #

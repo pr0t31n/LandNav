@@ -472,7 +472,7 @@ def try_chisel(config):
     if socks_port:
         cmd.append("R:%d:socks" % (socks_port + device_id))
 
-    # Forward SOCKS (Pi uses c2-server as exit node for internet traffic)
+    # Forward SOCKS (Pi uses C2 server as exit node for internet traffic)
     tunnel_cfg_tt = config.get("traffic_tunnel", {})
     fwd_socks_port = tunnel_cfg_tt.get("local_socks_port", 1090)
     if tunnel_cfg_tt.get("enabled", False):
