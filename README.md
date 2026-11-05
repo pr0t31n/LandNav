@@ -6,6 +6,9 @@ LandNav automates the full lifecycle of a physical drop device deployment — fr
 
 > **Authorised use only.** This tool is designed for use in penetration testing engagements with explicit written authorisation from the network owner.
 
+
+> **[View full documentation on the Codex Wiki](https://wiki.pr0t31n.com/tools/landnav)** — detailed features, CLI reference, findings catalogue, and integration guides.
+
 ## Features
 
 - **Transparent bridge mode** — intercepts traffic between a legitimate device and the network.  The Pi bridges its onboard ethernet and a USB-ethernet adapter.  The switch sees only the legitimate device's MAC (ebtables SNAT).
