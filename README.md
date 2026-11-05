@@ -75,6 +75,22 @@ LandNav automates the full lifecycle of a physical drop device deployment — fr
 - **Watchdog** — monitors C2 health and automatically re-establishes on failure
 - **YAML config** — all engagement-specific settings in one file
 - **Systemd boot service** — runs automatically on power-up, restarts on failure
+- **Chisel C2** — parallel SOCKS5 tunnel alongside iodine and meterpreter, with TLS wrapping
+- **SSH key auto-generation** — generates ed25519 keypair on first run if missing
+- **Auto commands** — `auto_commands.txt` script executed automatically once C2 is established
+- **Bridge reuse** — detects and reuses existing system-managed bridges (no teardown needed)
+- **Status heartbeat** — background thread writes `/tmp/landnav_status.json` every 30 seconds with current state
+- **Handler prep mode** — `--prep-handler` generates a Metasploit resource script for the engagement listener
+
+## CLI Reference
+
+| Flag | Description |
+|------|-------------|
+| `--config`, `-c` | Path to YAML config file (default: `config.yaml` in tool dir) |
+| `--dry-run` | Print config and exit without connecting |
+| `--status` | Print current LandNav status and exit |
+| `--prep-handler` | Generate Metasploit resource script for the listener |
+| `--version`, `-v` | Print version and exit |
 
 ## Requirements
 
