@@ -58,6 +58,39 @@ def _has(binary):
 
 
 
+    return shutil.which(binary) is not None
+
+
+def _brew_safe(args):
+    """Run brew with args, delegating to SUDO_USER when running as root."""
+    brew_path = shutil.which("brew")
+    if not brew_path:
+        for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
+            if os.path.isfile(p):
+                brew_path = p
+                break
+    if not brew_path:
+        print("  [!] brew not found — skipping")
+        return
+    cmd = [brew_path] + args
+    if os.geteuid() == 0:
+        user = os.environ.get("SUDO_USER", "").strip()
+        if not user or user == "root":
+            try:
+                r = subprocess.run(["logname"], capture_output=True, text=True, timeout=3)
+                user = r.stdout.strip() if r.returncode == 0 else ""
+            except Exception:
+                user = ""
+        if not user or user == "root":
+            print(f"  [!] Running as root with no real user — skipping: brew {' '.join(args)}")
+            return
+        cmd = ["sudo", "-u", user, "-H"] + cmd
+    print(f"  → {' '.join(cmd)}")
+    subprocess.run(cmd, check=False)
+
+
+
+
 def _dpkg_installed(pkg):
     try:
         r = subprocess.run(["dpkg", "-s", pkg],
@@ -88,9 +121,22 @@ def _pip_installed(pkg_spec):
 
 
 def _brew_installed_set():
+    brew_path = shutil.which("brew")
+    if not brew_path:
+        for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
+            if os.path.isfile(p):
+                brew_path = p
+                break
+    if not brew_path:
+        return set()
+    cmd = [brew_path, "list", "--formula", "-1"]
+    if os.geteuid() == 0:
+        user = os.environ.get("SUDO_USER", "").strip()
+        if not user or user == "root":
+            return set()
+        cmd = ["sudo", "-u", user, "-H"] + cmd
     try:
-        r = subprocess.run(["brew", "list", "--formula", "-1"],
-                           capture_output=True, text=True, check=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return set(r.stdout.strip().splitlines())
     except (subprocess.CalledProcessError, FileNotFoundError):
         return set()
@@ -238,7 +284,7 @@ def install_system_deps(os_name, dry_run=False):
             if pkg in installed:
                 info(f"✓ {pkg} already installed")
                 continue
-            _run(["brew", "install", pkg], dry_run=dry_run, check=False)
+            _brew_safe(["install", pkg]) if not dry_run else print(f"  [dry-run] brew install {pkg}")
         warn("macOS: bridge/ebtables/arping/responder not available — "
              "LandNav bridge mode and Responder require Linux")
 
